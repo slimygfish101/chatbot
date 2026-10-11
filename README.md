@@ -10,16 +10,16 @@ The admin texts one phone number from his flip phone, and every boy on the list 
 1. The admin texts the group number. That number belongs to Telnyx, the texting company.
 2. Telnyx passes the text to this program, which runs free on Cloudflare.
 3. The program checks that the text really came from Telnyx and from an admin's phone, then saves it as a "blast".
-4. It sends the blast to every active boy, one ordinary SMS each, about 15 a minute. That's the speed limit carriers set for this kind of registration.
-5. When everyone has it, the admin gets the summary.
+4. Within a minute it starts sending, one ordinary SMS per boy, 15 a minute. That's the speed limit carriers set for this kind of registration, so 100 boys take about 7 minutes.
+5. A minute or two after the last text, once the phone companies report back, the admin gets the summary. Texts a carrier reports as undelivered count as failed.
 
 Replies from boys are ignored, except:
 
 | A boy texts | What happens |
 |---|---|
-| STOP, STOPALL, UNSUBSCRIBE, CANCEL, END or QUIT | He's taken off the list. Telnyx sends him the "you're unsubscribed" confirmation. |
-| START or UNSTOP | If he'd been on the list and texted STOP, he's back on. Nobody new can join this way. |
-| HELP or INFO | He gets: "[Group] announcements from [Admin]. Reply STOP to opt out." |
+| STOP, STOPALL, UNSUBSCRIBE, CANCEL, END or QUIT | He's taken off the list and can't be re-added by the admin or an import. This is recorded even for numbers not on the list. Telnyx sends him the "you're unsubscribed" confirmation. |
+| START or UNSTOP | He goes back to where he was before STOP: on the list if he was on it, otherwise not. Nobody new can join this way. |
+| HELP or INFO | He gets: "[Group] announcements from [Admin]. Reply STOP to opt out." (at most once a day per number) |
 
 ## Everyday tasks
 
@@ -39,11 +39,13 @@ All of these are run by Claude Code (or anyone) from this folder. You never need
 ## Safety features
 
 - **Signature check:** every message from Telnyx is signed. Anything unsigned, forged or older than 5 minutes is rejected.
-- **No double sends:** Telnyx sometimes delivers the same message twice. Each one is recorded, so a repeat never causes a second blast. Two copies of the sender running at once can't send the same batch.
-- **One at a time:** a second blast waits until the first one finishes.
-- **Daily cap:** at most `MAX_TEXTS_PER_DAY` texts (default 1000) a day. If it's reached, sending pauses, the admin is told once, and the rest goes out the next day. `#cancel` stops it.
-- **Retries:** if Telnyx is busy (429) or has an error (5xx), that boy is retried after 30s, 60s and 120s. After 4 tries he's counted as failed.
-- **DRY_RUN:** logs what would be sent and sends nothing. It's on by default, and stays on unless set to exactly `"false"`.
+- **No double sends:** Telnyx sometimes delivers the same message twice. Each one is recorded, so a repeat never causes a second blast. Two copies of the sender running at once can't send the same batch. Each boy's result is saved the moment his text goes out, so if the program is ever cut off mid-batch, the one text in flight is never resent, and the boys not yet reached still get it.
+- **Pacing:** batches are at least a minute apart, so the 15-a-minute carrier limit is never exceeded.
+- **One at a time:** a second blast waits until the first one finishes. `#cancel` stops the one sending (between texts), or the next one waiting if nothing is sending.
+- **Daily cap:** at most `MAX_TEXTS_PER_DAY` texts a day (default 1000; a long message counts as 2–3). If it's reached, sending pauses, the admin is told once, and the rest goes out after midnight. `#cancel` stops it. HELP replies never go past the cap.
+- **Retries:** if Telnyx is busy (429), has an error (5xx) or doesn't answer within 10 seconds, that boy is retried after 30s, 60s and 120s. After 4 tries he's counted as failed. The summary is retried too.
+- **Errors:** if something fails before a blast is saved, the admin gets "Not sent because of a system error. Please send it again."
+- **DRY_RUN:** logs what would be sent and sends nothing. It's on by default, and stays on unless set to exactly `"false"`. Dry runs don't use up the daily cap or count as anyone's welcome text.
 - **Opt-outs win:** someone who texted STOP is never texted again, even if the admin `#add`s him or he's in an imported list.
 - **No media:** only the words of a message are ever sent, never pictures.
 - **Secrets** (Telnyx key, phone numbers) live only in Cloudflare's encrypted secret store and in the environment, never in this repository.
@@ -65,7 +67,7 @@ These are the owner's researched Telnyx rates. The setup script shows the real p
 
 - **Speed:** carriers allow Sole Proprietor numbers about 15 texts a minute, so 100 boys takes about 7 minutes. No setting can make it faster. A Low-Volume Standard registration is faster, but it needs an EIN.
 - **Daily:** T-Mobile allows a Sole Proprietor brand 1,000 texts a day. That's about 10 blasts to 100 boys.
-- **Cloudflare free plan:** everything fits. Each minute the sender makes about 15 calls to Telnyx and about 12 database calls, under the free limit of 50 per run. A run uses well under the 10 ms CPU limit, because time spent waiting on Telnyx doesn't count. The once-a-minute schedule adds about 1,440 runs a day, far under the 100,000-request daily limit.
+- **Cloudflare free plan:** everything fits. The busiest run (a batch of 15 that also finishes the job and texts the summary) makes 44 calls to Telnyx and the database combined, counted the strictest way, under the free limit of 50. A test enforces this. A run uses well under the 10 ms CPU limit, because time spent waiting on Telnyx doesn't count. The once-a-minute schedule adds about 1,440 runs a day, far under the 100,000-request daily limit, and about 3,000 database writes a day, far under the 100,000 limit. Keep `SEND_BATCH_SIZE` at 15 or below on the free plan.
 
 ---
 
@@ -93,7 +95,7 @@ test/           unit + flow tests (in-memory SQLite stand-in for D1) and signed 
 |---|---|
 | `npm test` | All tests |
 | `npm run typecheck` | TypeScript check |
-| `npm run smoke` | End-to-end check in the real Workers runtime, dry run |
+| `npm run smoke` | End-to-end check in the real Workers runtime (local D1, signed webhooks, dry run) |
 | `npm run telnyx -- <step>` | One Telnyx setup step (run with no step to list them) |
 | `npm run deploy` | Deploy everything |
 

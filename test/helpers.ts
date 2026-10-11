@@ -8,6 +8,9 @@ import type { Deps } from "../src/inbound";
 import { Store } from "../src/store";
 import type { FetchFn } from "../src/telnyx";
 
+/** Every SQL statement executed (batch statements counted one by one). */
+export const d1Stats = { statements: 0 };
+
 class FakeStatement {
   constructor(private db: DatabaseSync, private sql: string, private args: unknown[] = []) {}
   bind(...args: unknown[]) {
@@ -17,13 +20,16 @@ class FakeStatement {
     return this.runSync();
   }
   runSync() {
+    d1Stats.statements++;
     const r = this.db.prepare(this.sql).run(...(this.args as any[]));
     return { success: true, results: [], meta: { changes: Number(r.changes), last_row_id: Number(r.lastInsertRowid) } };
   }
   async all() {
+    d1Stats.statements++;
     return { success: true, results: this.db.prepare(this.sql).all(...(this.args as any[])), meta: {} };
   }
   async first() {
+    d1Stats.statements++;
     return this.db.prepare(this.sql).get(...(this.args as any[])) ?? null;
   }
 }

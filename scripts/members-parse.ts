@@ -99,7 +99,13 @@ function cleanName(s: string): string {
 
 /** Hides all but the last 4 digits of every phone number in a line, for printing. */
 export function maskLine(text: string): string {
-  return text.replace(PHONE_RE, (m) => `…${m.replace(/\D/g, "").slice(-4)}`).replace(/\d(?=(?:\D*\d){4})/g, "•");
+  return text
+    .replace(PHONE_RE, (m) => `…${m.replace(/\D/g, "").slice(-4)}`)
+    .replace(/\d[\d\s().\-]*\d/g, (run) => {
+      // Any other run of 5+ digits (a malformed number) keeps only its last 4.
+      const digits = run.replace(/\D/g, "");
+      return digits.length >= 5 ? `…${digits.slice(-4)}` : run;
+    });
 }
 
 export function toCsv(rows: { name: string; phone: string }[]): string {

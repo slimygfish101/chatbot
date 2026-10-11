@@ -43,6 +43,8 @@ async function main() {
       `TELNYX_NUMBER=${OURS}`,
       `ADMIN_NUMBERS=${ADMIN}`,
       "DRY_RUN=true",
+      // One batch covers all 20 test members (batches are a minute apart).
+      "SEND_BATCH_SIZE=30",
       "GROUP_NAME=Smoke Test",
       "ADMIN_NAME=Tester",
     ].join("\n"),
@@ -60,7 +62,8 @@ async function main() {
   const dev = spawn(
     "npx",
     ["--no-install", "wrangler", "dev", "--port", String(PORT), "--persist-to", persist, "--env-file", varsFile, "--test-scheduled", "--show-interactive-dev-session=false"],
-    { cwd: ROOT, env: { ...process.env, CI: "true" } },
+    // Own process group, so the runtime it starts is stopped with it.
+    { cwd: ROOT, env: { ...process.env, CI: "true" }, detached: true },
   );
   dev.stdout.on("data", (d) => logs.push(String(d)));
   dev.stderr.on("data", (d) => logs.push(String(d)));
@@ -92,6 +95,7 @@ async function main() {
     check((await post(blast, other.privateKey)).status === 401, "Wrong signature rejected");
     check((await post(blast, keys.privateKey, Math.floor(Date.now() / 1000) - 600)).status === 401, "Old timestamp rejected");
     await new Promise((r) => setTimeout(r, 2000));
+    check(d1("SELECT status FROM jobs")[0]?.status === "queued", "Blast saved and waiting for the minute run");
 
     for (let i = 0; i < 3; i++) {
       await fetch(`${base}/__scheduled?cron=*+*+*+*+*`);
@@ -107,13 +111,19 @@ async function main() {
     await post(fixture("member-stop.json"));
     await new Promise((r) => setTimeout(r, 1500));
     check(d1("SELECT status FROM members WHERE phone='+13475551000'")[0]?.status === "opted_out", "STOP from a member opts him out");
+    const locks = d1("SELECT until FROM locks WHERE name = 'sender'");
+    check(locks.length === 1 && locks[0].until > Date.now(), "Next batch held back about a minute (pacing lock)");
 
     const out = logs.join("");
     check(out.includes('"event":"dry_run_send"'), "Dry-run sends are logged");
     check(!/\+1\d{10}/.test(out.replace(/https?:\/\/\S+/g, "")), "No full phone numbers in the logs");
     check(out.includes('"event":"job_done"'), "Summary logged");
   } finally {
-    dev.kill("SIGINT");
+    try {
+      process.kill(-dev.pid!, "SIGTERM");
+    } catch {
+      dev.kill("SIGTERM");
+    }
     await new Promise((r) => setTimeout(r, 1000));
     if (failures) console.log("\n--- wrangler dev output ---\n" + logs.join("").slice(-4000));
     rmSync(persist, { recursive: true, force: true });

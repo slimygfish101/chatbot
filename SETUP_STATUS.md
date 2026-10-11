@@ -7,7 +7,8 @@ To resume in a new Claude Code session, paste:
 ## Done
 
 - [x] Program written: webhook, admin commands, batched sending, retries, daily cap, dry run, opt-out handling
-- [x] 109 automated tests, plus an end-to-end check in Cloudflare's real runtime (`npm run smoke`)
+- [x] 137 automated tests, plus an end-to-end check in Cloudflare's real runtime (`npm run smoke`)
+- [x] Independent multi-reviewer audit: 39 confirmed findings (about 15 distinct issues), all fixed and covered by tests
 - [x] Setup scripts for every Telnyx and Cloudflare step, so nobody needs to click through dashboards
 - [x] README and the admin cheat sheet
 

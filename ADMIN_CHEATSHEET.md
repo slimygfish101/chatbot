@@ -4,11 +4,11 @@ Text the group number like a normal text. **Anything that doesn't start with `#`
 
 | You text | What happens |
 |---|---|
-| Any normal message | Goes to every boy, about 15 a minute (100 boys ≈ 7 minutes). Then you get a summary like "Sent to 98 of 100. 2 failed." |
+| Any normal message | Starts going out within a minute, 15 boys a minute (100 boys ≈ 7 minutes). A minute or two later you get a summary like "Sent to 98 of 100. 2 failed." |
 | `#add 2125551234 Moshe` | Adds Moshe and sends him the welcome text |
 | `#remove 2125551234` | Takes that boy off the list |
 | `#count` | Tells you how many boys are on the list |
-| `#cancel` | Stops a message that's still going out |
+| `#cancel` | Stops a message that's still going out (or one that's waiting its turn) |
 | `#help` | Texts you this list |
 
 **Three rules**
