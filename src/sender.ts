@@ -75,11 +75,13 @@ function toResult(phone: string, attempts: number, res: SendResult, now: Date): 
  * trigger. A lock stops two runs from overlapping, and after a run that sent
  * texts the lock stays closed for BATCH_GAP_MS, which paces the batches.
  */
-export async function runSender(cfg: Config, deps: Deps): Promise<string> {
+export async function runSender(cfg: Config, deps: Deps, scheduledMs?: number): Promise<string> {
   if (cfg.paused) return "paused";
   const { store } = deps;
   const lockToken = crypto.randomUUID();
-  const startMs = deps.now().getTime();
+  // Pace from the cron's scheduled minute, not the moment this run happened to
+  // start, so a run that starts a few seconds late doesn't make the next one skip.
+  const startMs = Math.min(scheduledMs ?? Infinity, deps.now().getTime());
   if (!(await store.acquireLock("sender", lockToken, startMs, LOCK_TTL_MS))) return "locked";
 
   let sentBatch = false;

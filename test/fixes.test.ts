@@ -84,29 +84,63 @@ describe("dry run has no lasting side effects", () => {
 });
 
 describe("STOP is always recorded", () => {
-  it("STOP from a removed member: an import or #add can't bring him back; START returns him to 'removed'", async () => {
+  it("STOP from a removed member: #add or an import can't text him; START alone returns him to 'removed'", async () => {
     const s = setup();
     s.db.sqlite.exec(`INSERT INTO members (phone,name,status,added_at,updated_at) VALUES ('+17185551234','Moshe','removed','x','x')`);
     await handleInbound(s.cfg, s.deps, inbound("+17185551234", "STOP"));
-    expect(status(s, "+17185551234")).toBe("opted_out");
-    await handleInbound(s.cfg, s.deps, inbound(ADMIN, "#add 7185551234 Moshe"));
-    expect(status(s, "+17185551234")).toBe("opted_out");
-    for (const q of buildImportSql([{ name: "Moshe", phone: "+17185551234" }], "t")) s.db.sqlite.exec(q);
     expect(status(s, "+17185551234")).toBe("opted_out");
     await handleInbound(s.cfg, s.deps, inbound("+17185551234", "start"));
     expect(status(s, "+17185551234")).toBe("removed");
   });
 
-  it("STOP from a stranger is recorded; his START doesn't put him on the list; then #add works", async () => {
+  it("#add of someone who texted STOP: not texted now, joins the list when he texts START", async () => {
     const s = setup();
     await handleInbound(s.cfg, s.deps, inbound("+17185559999", "quit"));
     expect(status(s, "+17185559999")).toBe("opted_out");
     await handleInbound(s.cfg, s.deps, inbound(ADMIN, "#add 7185559999 Avi"));
     expect(s.telnyx.to("+17185559999")).toHaveLength(0);
+    expect(s.telnyx.to(ADMIN)[0].text).toBe("Not added yet: Avi (ending 9999) texted STOP. He'll be added when he texts START to this number.");
+    expect(status(s, "+17185559999")).toBe("opted_out");
     await handleInbound(s.cfg, s.deps, inbound("+17185559999", "UNSTOP"));
+    expect(s.db.rows("SELECT name, status FROM members WHERE phone = '+17185559999'")).toEqual([{ name: "Avi", status: "active" }]);
+  });
+
+  it("an imported list does the same for someone who texted STOP", async () => {
+    const s = setup();
+    await handleInbound(s.cfg, s.deps, inbound("+17185559999", "STOP"));
+    for (const q of buildImportSql([{ name: "Avi", phone: "+17185559999" }], "t")) s.db.sqlite.exec(q);
+    expect(status(s, "+17185559999")).toBe("opted_out");
+    await handleInbound(s.cfg, s.deps, inbound("+17185559999", "START"));
+    expect(status(s, "+17185559999")).toBe("active");
+  });
+
+  it("a stranger's STOP then START doesn't put him on the list, and #add works after", async () => {
+    const s = setup();
+    await handleInbound(s.cfg, s.deps, inbound("+17185559999", "STOP"));
+    await handleInbound(s.cfg, s.deps, inbound("+17185559999", "START"));
     expect(status(s, "+17185559999")).toBe("removed");
     await handleInbound(s.cfg, s.deps, inbound(ADMIN, "#add 7185559999 Avi"));
     expect(status(s, "+17185559999")).toBe("active");
+  });
+
+  it("#remove of someone who texted STOP: his later START doesn't put him back", async () => {
+    const s = setup();
+    const [p] = addMembers(s.db, 1);
+    await handleInbound(s.cfg, s.deps, inbound(p, "STOP"));
+    await handleInbound(s.cfg, s.deps, inbound(ADMIN, "#remove " + p));
+    await handleInbound(s.cfg, s.deps, inbound(p, "START"));
+    expect(status(s, p)).toBe("removed");
+  });
+
+  it("#count doesn't count strangers or admins whose STOP was recorded", async () => {
+    const s = setup();
+    const [p] = addMembers(s.db, 3);
+    await handleInbound(s.cfg, s.deps, inbound(p, "STOP"));
+    await handleInbound(s.cfg, s.deps, inbound("+17185550011", "STOP"));
+    await handleInbound(s.cfg, s.deps, inbound(ADMIN, "cancel"));
+    await handleInbound(s.cfg, s.deps, inbound(ADMIN, "START"));
+    await handleInbound(s.cfg, s.deps, inbound(ADMIN, "#count"));
+    expect(s.telnyx.to(ADMIN).at(-1)!.text).toBe("2 active members. 1 opted out.");
   });
 
   it("STOP then START from an active member puts him back on the list", async () => {
@@ -247,19 +281,19 @@ describe("summary", () => {
 });
 
 describe("errors before a blast is saved", () => {
-  it("tell the admin to resend, and the resend isn't treated as a duplicate", async () => {
+  it("tell the admin to resend", async () => {
     const s = setup();
     addMembers(s.db, 2);
     const real = s.deps.store.createBlastJob.bind(s.deps.store);
     s.deps.store.createBlastJob = async () => {
       throw new Error("D1_ERROR: Network connection lost");
     };
-    const msg = inbound(ADMIN, "hi");
-    expect(await handleInbound(s.cfg, s.deps, msg)).toBe("failed");
+    expect(await handleInbound(s.cfg, s.deps, inbound(ADMIN, "hi"))).toBe("failed");
     expect(s.telnyx.to(ADMIN)[0].text).toBe("Not sent because of a system error. Please send it again.");
     expect(s.db.rows("SELECT * FROM jobs")).toHaveLength(0);
     s.deps.store.createBlastJob = real;
-    expect(await handleInbound(s.cfg, s.deps, msg)).toBe("blast_created");
+    // A resend from the phone is a new message (new id).
+    expect(await handleInbound(s.cfg, s.deps, inbound(ADMIN, "hi"))).toBe("blast_created");
   });
 
   it("errors after the blast is saved don't ask for a resend (that would double-send)", async () => {
@@ -271,6 +305,152 @@ describe("errors before a blast is saved", () => {
     expect(await handleInbound(s.cfg, s.deps, inbound(ADMIN, "hi"))).toBe("blast_created");
     expect(s.telnyx.to(ADMIN)).toHaveLength(0);
     expect(s.db.rows("SELECT status FROM jobs")).toEqual([{ status: "queued" }]);
+  });
+});
+
+describe("second review round", () => {
+  it("#cancel right after a blast finished (waiting for delivery reports) cancels the queued one, not the finished one", async () => {
+    const s = setup();
+    const phones = addMembers(s.db, 5);
+    await handleInbound(s.cfg, s.deps, inbound(ADMIN, "Blast A"));
+    expect(await runSender(s.cfg, s.deps)).toBe("waiting_receipts");
+    await handleInbound(s.cfg, s.deps, inbound(ADMIN, "WRONG blast B"));
+    await handleInbound(s.cfg, s.deps, inbound(ADMIN, "#cancel"));
+    expect(s.telnyx.to(ADMIN).at(-1)!.text).toBe('Cancelled "WRONG blast B". 0 of 5 had already been sent.');
+    receipts(s);
+    s.clock.advance(60_000);
+    await drain(s);
+    for (const p of phones) expect(s.telnyx.to(p).map((m) => m.text)).toEqual(["Blast A"]);
+    expect(s.telnyx.to(ADMIN).map((m) => m.text)).toContain("Sent to 5 of 5.");
+  });
+
+  it("a Telnyx timeout is never retried (it may have been sent)", async () => {
+    const s = setup();
+    const [a, b] = addMembers(s.db, 2);
+    const real = s.telnyx.fetch;
+    s.deps.fetch = async (url, init) => {
+      const res = await real(url, init); // Telnyx got it...
+      if (JSON.parse(String(init?.body)).to === a) throw Object.assign(new Error("timed out"), { name: "TimeoutError" }); // ...but answered too late
+      return res;
+    };
+    await handleInbound(s.cfg, s.deps, inbound(ADMIN, "hi"));
+    await drain(s);
+    expect(s.telnyx.to(a)).toHaveLength(1);
+    expect(s.telnyx.to(b)).toHaveLength(1);
+    expect(s.db.rows("SELECT status, error FROM job_recipients WHERE phone = ?", a)).toEqual([
+      { status: "failed", error: "timeout: may have been sent" },
+    ]);
+  });
+
+  it("a network error before reaching Telnyx is retried", async () => {
+    const s = setup();
+    const [a] = addMembers(s.db, 1);
+    let first = true;
+    const real = s.telnyx.fetch;
+    s.deps.fetch = async (url, init) => {
+      if (first && JSON.parse(String(init?.body)).to === a) {
+        first = false;
+        throw new TypeError("fetch failed");
+      }
+      return real(url, init);
+    };
+    await handleInbound(s.cfg, s.deps, inbound(ADMIN, "hi"));
+    await drain(s);
+    expect(s.telnyx.to(a)).toHaveLength(1);
+    expect(s.db.rows("SELECT status FROM job_recipients")).toEqual([{ status: "sent" }]);
+  });
+
+  it("if the database saved the blast but reported an error, the admin isn't told to resend", async () => {
+    const s = setup();
+    const phones = addMembers(s.db, 2);
+    const real = s.deps.store.createBlastJob.bind(s.deps.store);
+    s.deps.store.createBlastJob = async (...a) => {
+      await real(...a);
+      throw new Error("D1_ERROR: Network connection lost");
+    };
+    expect(await handleInbound(s.cfg, s.deps, inbound(ADMIN, "hi"))).toBe("blast_created");
+    expect(s.telnyx.to(ADMIN)).toHaveLength(0);
+    await drain(s);
+    for (const p of phones) expect(s.telnyx.to(p)).toHaveLength(1);
+  });
+
+  it("an error during a command gets a neutral reply, never 'send it again'", async () => {
+    const s = setup();
+    addMembers(s.db, 2);
+    await handleInbound(s.cfg, s.deps, inbound(ADMIN, "A"));
+    s.deps.store.jobCounts = async () => {
+      throw new Error("boom");
+    };
+    expect(await handleInbound(s.cfg, s.deps, inbound(ADMIN, "#cancel"))).toBe("failed");
+    expect(s.telnyx.to(ADMIN).at(-1)!.text).toBe("Something went wrong. That command may or may not have worked.");
+  });
+
+  it("after a crash, a recovered recipient who was #removed meanwhile is skipped", async () => {
+    const s = setup();
+    const phones = addMembers(s.db, 4);
+    await handleInbound(s.cfg, s.deps, inbound(ADMIN, "hi"));
+    let saves = 0;
+    const realSave = s.deps.store.saveResult.bind(s.deps.store);
+    s.deps.store.saveResult = async (...a) => {
+      if (++saves === 2) throw new Error("Worker killed");
+      return realSave(...a);
+    };
+    await expect(runSender(s.cfg, s.deps)).rejects.toThrow();
+    s.deps.store.saveResult = realSave;
+    await handleInbound(s.cfg, s.deps, inbound(ADMIN, "#remove " + phones[3]));
+    s.clock.advance(11 * 60_000);
+    await drain(s);
+    expect(s.telnyx.to(phones[3])).toHaveLength(0);
+    expect(s.telnyx.to(phones[2])).toHaveLength(1);
+  });
+
+  it("a welcome job skips someone the admin welcomed with #add meanwhile", async () => {
+    const s = setup();
+    const rows = Array.from({ length: 20 }, (_, i) => ({ name: `B${i}`, phone: `+1718555${String(4000 + i)}` }));
+    for (const q of buildImportSql(rows, "t", "Welcome!")) s.db.sqlite.exec(q);
+    await runSender(s.cfg, s.deps); // 15 welcomed
+    await handleInbound(s.cfg, s.deps, inbound(ADMIN, "#remove 7185554019"));
+    await handleInbound(s.cfg, s.deps, inbound(ADMIN, "#add 7185554019 B19"));
+    s.clock.advance(60_000);
+    await drain(s);
+    expect(s.telnyx.to("+17185554019")).toHaveLength(1);
+  });
+
+  it("pacing follows the cron's scheduled minute, so a late start doesn't skip the next minute", async () => {
+    const s = setup();
+    const phones = addMembers(s.db, 30);
+    await handleInbound(s.cfg, s.deps, inbound(ADMIN, "hi"));
+    const minute = s.clock.now().getTime();
+    s.clock.advance(7_000); // this run starts 7s late
+    expect(await runSender(s.cfg, s.deps, minute)).toBe("sent_batch");
+    s.clock.t = minute + 60_300; // next run on time
+    expect(await runSender(s.cfg, s.deps, minute + 60_000)).not.toBe("locked");
+    expect(membersSent(s, phones)).toBe(30);
+  });
+
+  it("a failed HELP reply can be retried the same day", async () => {
+    const s = setup();
+    let fail = true;
+    s.telnyx.respond = () => (fail ? { status: 503, body: {} } : null);
+    await handleInbound(s.cfg, s.deps, inbound("+17185559999", "HELP"));
+    fail = false;
+    await handleInbound(s.cfg, s.deps, inbound("+17185559999", "HELP"));
+    expect(s.telnyx.to("+17185559999")).toHaveLength(1);
+  });
+
+  it("#cancel reply stays one plain text even for Hebrew or emoji blasts", async () => {
+    const s = setup();
+    addMembers(s.db, 1);
+    await handleInbound(s.cfg, s.deps, inbound(ADMIN, "Practice cancelled today🏀 see you Sunday"));
+    await handleInbound(s.cfg, s.deps, inbound(ADMIN, "#cancel"));
+    await handleInbound(s.cfg, s.deps, inbound(ADMIN, "שיעור מבוטל היום"));
+    await handleInbound(s.cfg, s.deps, inbound(ADMIN, "#cancel"));
+    const replies = s.telnyx.to(ADMIN).map((m) => m.text);
+    expect(replies).toEqual([
+      'Cancelled "Practice cancelled today...". 0 of 1 had already been sent.',
+      'Cancelled "your message". 0 of 1 had already been sent.',
+    ]);
+    for (const r of replies) expect(countSegments(r)).toEqual({ encoding: "GSM-7", segments: 1 });
   });
 });
 
@@ -322,6 +502,12 @@ describe("member list parser edge cases", () => {
     ]);
   });
 
+  it("names ending in x, and grade columns, aren't mistaken for extensions", () => {
+    const r = parseMemberList("Alex\t2125551234\t9\nMax Cox 212-555-1235 12\n2125551236 Felix 10\nAlex 11 718-555-1237");
+    expect(r.rows.map((x) => x.phone)).toEqual(["+12125551234", "+12125551235", "+12125551236", "+17185551237"]);
+    expect(r.flags.every((f) => !f.problem.includes("extension"))).toBe(true);
+  });
+
   it("numbers with an extension are skipped as not-a-cell", () => {
     const r = parseMemberList("Office 212-555-7000 ext 12");
     expect(r.rows).toEqual([]);
@@ -337,6 +523,8 @@ describe("member list parser edge cases", () => {
   it("previews never show a full number", () => {
     expect(maskLine("Moshe (718) 555-1234 and +1 347 555 9876 x")).toBe("Moshe …1234 and …9876 x");
     expect(maskLine("bad 555-12345678")).not.toMatch(/\d{5}/);
+    expect(maskLine("Alex\t2125551234\t9")).toBe("Alex\t…1234\t9");
+    expect(maskLine("Moshe 212–555–1234 and 212/555/9876")).toBe("Moshe …1234 and …9876");
   });
 });
 

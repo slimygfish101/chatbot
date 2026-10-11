@@ -3,7 +3,7 @@ import { HELP_TEXT, isCommand, parseCommand } from "./commands";
 import { classifyKeyword, type Keyword } from "./keywords";
 import { log } from "./log";
 import { mask, smsMask, toE164 } from "./phone";
-import { countSegments } from "./segments";
+import { countSegments, isGsmChar } from "./segments";
 import type { Job, Store } from "./store";
 import type { FetchFn, SendResult } from "./telnyx";
 import { dayKey, sendAndCount } from "./sender";
@@ -63,17 +63,25 @@ export async function handleInbound(cfg: Config, deps: Deps, p: InboundPayload):
   const hadMedia = Array.isArray(p.media) && p.media.length > 0;
   const isAdmin = cfg.admins.includes(from);
 
-  const progress = { blastSaved: false };
   try {
-    if (isAdmin) return await handleAdmin(cfg, deps, from, text, hadMedia, progress);
+    if (isAdmin) return await handleAdmin(cfg, deps, from, text, hadMedia, id);
     return await handleMember(cfg, deps, from, text, p.autoresponse_type);
   } catch (e) {
-    log("inbound_error", { id, from: mask(from), blastSaved: progress.blastSaved, error: String((e as Error)?.message ?? e) });
-    // If the blast was saved it will still go out; asking for a resend would send it twice.
-    if (progress.blastSaved) return "blast_created";
-    // Otherwise forget this message id so a resend works, and tell the admin.
-    await deps.store.forgetProcessed(id).catch(() => undefined);
-    if (isAdmin) await reply(cfg, deps, from, "Not sent because of a system error. Please send it again.").catch(() => false);
+    log("inbound_error", { id, from: mask(from), error: String((e as Error)?.message ?? e) });
+    if (!isAdmin) return "failed";
+    // A database error can come back even though the write went through, so check
+    // before asking the admin to resend (a resend of a saved blast would go out twice).
+    if (!isCommand(text) && !classifyKeyword(text)) {
+      const saved = await deps.store.blastExistsFor(id).catch(() => null);
+      if (saved) return "blast_created";
+      const msg =
+        saved === false
+          ? "Not sent because of a system error. Please send it again."
+          : "Something went wrong. Your message may or may not go out. Wait 10 minutes before sending it again.";
+      await reply(cfg, deps, from, msg).catch(() => false);
+    } else {
+      await reply(cfg, deps, from, "Something went wrong. That command may or may not have worked.").catch(() => false);
+    }
     return "failed";
   }
 }
@@ -93,7 +101,13 @@ async function applyKeywordStatus(deps: Deps, from: string, kw: Keyword, nowIso:
   if (kw === "opt_in") await deps.store.optIn(from, nowIso);
 }
 
-const preview = (body: string) => (body.length > 25 ? `${body.slice(0, 25).trimEnd()}...` : body);
+/** First few words of a blast, in plain characters only, so the reply stays one ordinary text. */
+export function preview(body: string): string {
+  const chars = Array.from(body).filter(isGsmChar);
+  const short = chars.slice(0, 25).join("").replace(/\s+/g, " ").trim();
+  if (!short) return "your message";
+  return chars.length > 25 ? `${short}...` : short;
+}
 
 async function handleAdmin(
   cfg: Config,
@@ -101,7 +115,7 @@ async function handleAdmin(
   admin: string,
   text: string,
   hadMedia: boolean,
-  progress: { blastSaved: boolean },
+  messageId: string,
 ): Promise<InboundOutcome> {
   const { store } = deps;
   const nowIso = deps.now().toISOString();
@@ -140,7 +154,8 @@ async function handleAdmin(
         const existing = await store.getMember(cmd.phone);
         const label = (name: string) => `${name || "Member"} (${smsMask(cmd.phone)})`;
         if (existing?.status === "opted_out") {
-          await reply(cfg, deps, admin, `Not added: ${label(existing.name)} texted STOP. He has to text START to this number himself.`);
+          await store.addAfterStart(cmd.phone, cmd.name, nowIso);
+          await reply(cfg, deps, admin, `Not added yet: ${label(cmd.name || existing.name)} texted STOP. He'll be added when he texts START to this number.`);
         } else if (existing?.status === "active") {
           if (cmd.name && cmd.name !== existing.name) await store.setName(cmd.phone, cmd.name, nowIso);
           await reply(cfg, deps, admin, `Already on the list: ${label(cmd.name || existing.name)}.`);
@@ -151,7 +166,8 @@ async function handleAdmin(
           if (!welcome.ok && welcome.optedOut) {
             // He had texted STOP to this number before; the carrier blocks us.
             await store.optOut(cmd.phone, nowIso);
-            await reply(cfg, deps, admin, `Not added: ${label(name)} had texted STOP. He has to text START to this number himself.`);
+            await store.addAfterStart(cmd.phone, name, nowIso);
+            await reply(cfg, deps, admin, `Not added yet: ${label(name)} had texted STOP. He'll be added when he texts START to this number.`);
             break;
           }
           if (welcome.ok && !cfg.dryRun) await store.markWelcomed(cmd.phone, nowIso);
@@ -165,7 +181,7 @@ async function handleAdmin(
         if (!existing) {
           await reply(cfg, deps, admin, `No member with number ${smsMask(cmd.phone)}.`);
         } else {
-          if (existing.status === "active") await store.setStatus(cmd.phone, "removed", nowIso);
+          await store.removeMember(cmd.phone, nowIso);
           const c = await store.countByStatus();
           await reply(cfg, deps, admin, `Removed ${existing.name || "member"} (${smsMask(cmd.phone)}). ${c.active} active.`);
         }
@@ -173,7 +189,7 @@ async function handleAdmin(
       }
       case "cancel": {
         // The one that's going out now; if none, the next one waiting.
-        const job: Job | null = (await store.getSendingJob()) ?? (await store.getOldestQueuedJob());
+        const job: Job | null = await store.getCancellableJob();
         if (!job) {
           await reply(cfg, deps, admin, "Nothing is sending right now.");
           break;
@@ -193,8 +209,7 @@ async function handleAdmin(
 
   // Anything else is a blast.
   const seg = countSegments(text);
-  const { jobId, recipients } = await store.createBlastJob(admin, text, seg.segments, seg.encoding, nowIso);
-  progress.blastSaved = recipients > 0;
+  const { jobId, recipients } = await store.createBlastJob(admin, text, seg.segments, seg.encoding, nowIso, messageId);
   log("blast_created", { job: jobId, recipients, segments: seg.segments, encoding: seg.encoding, dryRun: cfg.dryRun });
   if (recipients === 0) {
     await reply(cfg, deps, admin, "Not sent: there are no active members on the list.");
@@ -240,7 +255,9 @@ async function handleMember(
     // One reply per number per day, and never past the daily cap, so HELP can't be used to run up texts.
     const shouldReply =
       !telnyxAnswered && (await store.getDailyCount(day)) < cfg.maxTextsPerDay && (await store.firstHelpToday(from, day));
-    if (shouldReply) await reply(cfg, deps, from, helpReplyText(cfg));
+    if (shouldReply && !(await reply(cfg, deps, from, helpReplyText(cfg)))) {
+      await store.forgetHelp(from, day); // didn't go through; he can ask again
+    }
     log("member_help", { from: mask(from), replied: shouldReply });
     return "member_help";
   }

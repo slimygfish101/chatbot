@@ -58,6 +58,13 @@ async function main() {
   const values = Array.from({ length: 20 }, (_, i) => `('+1347555${1000 + i}','Boy ${i}','active','x','x')`).join(",");
   d1(`INSERT INTO members (phone,name,status,added_at,updated_at) VALUES ${values}`);
 
+  // A dev server left over from an interrupted run would answer instead of ours.
+  try {
+    await fetch(`http://127.0.0.1:${PORT}`);
+    console.error(`Port ${PORT} is already in use (a leftover \`wrangler dev\`?). Stop it and run again.`);
+    process.exit(1);
+  } catch {}
+
   const logs: string[] = [];
   const dev = spawn(
     "npx",
@@ -65,9 +72,35 @@ async function main() {
     // Own process group, so the runtime it starts is stopped with it.
     { cwd: ROOT, env: { ...process.env, CI: "true" }, detached: true },
   );
+  const stopDev = () => {
+    try {
+      process.kill(-dev.pid!, "SIGTERM");
+    } catch {}
+  };
+  // Also stop it if this script is interrupted (Ctrl+C, a timeout).
+  for (const sig of ["SIGINT", "SIGTERM", "SIGHUP"] as const) {
+    process.on(sig, () => {
+      stopDev();
+      rmSync(persist, { recursive: true, force: true });
+      process.exit(130);
+    });
+  }
   dev.stdout.on("data", (d) => logs.push(String(d)));
   dev.stderr.on("data", (d) => logs.push(String(d)));
   const base = `http://127.0.0.1:${PORT}`;
+  // The local dev server occasionally drops a connection while the D1 command
+  // line tool touches the same database files. Retrying is safe: webhooks are
+  // deduplicated and only a refused connection (no response at all) is retried.
+  const fetchRetry = async (url: string, init?: RequestInit) => {
+    for (let i = 0; ; i++) {
+      try {
+        return await fetch(url, init);
+      } catch (e) {
+        if (i >= 2) throw e;
+        await new Promise((r) => setTimeout(r, 2000));
+      }
+    }
+  };
 
   try {
     for (let i = 0; i < 60; i++) {
@@ -80,7 +113,7 @@ async function main() {
 
     const post = async (body: string, key = keys.privateKey, ts = Math.floor(Date.now() / 1000)) => {
       const sig = await crypto.subtle.sign({ name: "Ed25519" }, key, new TextEncoder().encode(`${ts}|${body}`));
-      return fetch(`${base}/telnyx`, {
+      return fetchRetry(`${base}/telnyx`, {
         method: "POST",
         headers: { "telnyx-signature-ed25519": b64(sig), "telnyx-timestamp": String(ts), "content-type": "application/json" },
         body,
@@ -98,7 +131,7 @@ async function main() {
     check(d1("SELECT status FROM jobs")[0]?.status === "queued", "Blast saved and waiting for the minute run");
 
     for (let i = 0; i < 3; i++) {
-      await fetch(`${base}/__scheduled?cron=*+*+*+*+*`);
+      await fetchRetry(`${base}/__scheduled?cron=*+*+*+*+*`);
       await new Promise((r) => setTimeout(r, 1500));
     }
 
@@ -118,12 +151,11 @@ async function main() {
     check(out.includes('"event":"dry_run_send"'), "Dry-run sends are logged");
     check(!/\+1\d{10}/.test(out.replace(/https?:\/\/\S+/g, "")), "No full phone numbers in the logs");
     check(out.includes('"event":"job_done"'), "Summary logged");
+  } catch (e) {
+    const err = e as Error & { cause?: unknown };
+    check(false, `Unexpected error: ${err?.message} ${String(err?.cause ?? "")}\n${err?.stack?.split("\n").slice(1, 4).join("\n")}`);
   } finally {
-    try {
-      process.kill(-dev.pid!, "SIGTERM");
-    } catch {
-      dev.kill("SIGTERM");
-    }
+    stopDev();
     await new Promise((r) => setTimeout(r, 1000));
     if (failures) console.log("\n--- wrangler dev output ---\n" + logs.join("").slice(-4000));
     rmSync(persist, { recursive: true, force: true });

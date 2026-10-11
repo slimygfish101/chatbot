@@ -4,6 +4,11 @@ const GSM_BASIC =
   "¡ABCDEFGHIJKLMNOPQRSTUVWXYZÄÖÑÜ§¿abcdefghijklmnopqrstuvwxyzäöñüà";
 const GSM_EXTENDED = "^{}\\[~]|€\f";
 
+/** True if the character can be sent in a plain (GSM-7) text. */
+export function isGsmChar(ch: string): boolean {
+  return GSM_BASIC.includes(ch) || GSM_EXTENDED.includes(ch);
+}
+
 export interface SegmentInfo {
   encoding: "GSM-7" | "UCS-2";
   segments: number;

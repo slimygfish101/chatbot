@@ -56,11 +56,6 @@ export class Store {
     return (r.meta.changes ?? 0) > 0;
   }
 
-  /** Undo markProcessed after a failure, so a resend isn't treated as a duplicate. */
-  async forgetProcessed(messageId: string): Promise<void> {
-    await this.db.prepare("DELETE FROM processed_messages WHERE message_id = ?").bind(messageId).run();
-  }
-
   // ---- members ----
 
   getMember(phone: string): Promise<Member | null> {
@@ -82,8 +77,32 @@ export class Store {
     await this.db.prepare("UPDATE members SET name = ?, updated_at = ? WHERE phone = ?").bind(name, nowIso, phone).run();
   }
 
-  async setStatus(phone: string, status: MemberStatus, nowIso: string): Promise<void> {
-    await this.db.prepare("UPDATE members SET status = ?, updated_at = ? WHERE phone = ?").bind(status, nowIso, phone).run();
+  /** #remove: takes him off the list. If he had texted STOP, a later START won't put him back on. */
+  async removeMember(phone: string, nowIso: string): Promise<void> {
+    await this.db
+      .prepare(
+        `UPDATE members SET
+           status = CASE WHEN status = 'opted_out' THEN 'opted_out' ELSE 'removed' END,
+           status_before_optout = CASE WHEN status = 'opted_out' THEN 'removed' ELSE status_before_optout END,
+           updated_at = ?
+         WHERE phone = ?`,
+      )
+      .bind(nowIso, phone)
+      .run();
+  }
+
+  /**
+   * #add of someone who texted STOP: we can't text him, but when he texts START
+   * he goes straight onto the list (with this name).
+   */
+  async addAfterStart(phone: string, name: string, nowIso: string): Promise<void> {
+    await this.db
+      .prepare(
+        `UPDATE members SET status_before_optout = 'active', name = CASE WHEN ?1 = '' THEN name ELSE ?1 END, updated_at = ?2
+         WHERE phone = ?3 AND status = 'opted_out'`,
+      )
+      .bind(name, nowIso, phone)
+      .run();
   }
 
   /**
@@ -121,12 +140,19 @@ export class Store {
     await this.db.prepare("UPDATE members SET welcomed_at = ? WHERE phone = ?").bind(nowIso, phone).run();
   }
 
+  /**
+   * Counts for #count. "Opted out" only counts people who were on the list,
+   * not strangers or admins whose STOP was recorded.
+   */
   async countByStatus(): Promise<Record<MemberStatus, number>> {
     const { results } = await this.db
-      .prepare("SELECT status, COUNT(*) AS n FROM members GROUP BY status")
-      .all<{ status: MemberStatus; n: number }>();
+      .prepare(
+        `SELECT CASE WHEN status = 'opted_out' AND COALESCE(status_before_optout, '') != 'active' THEN 'other' ELSE status END AS status,
+           COUNT(*) AS n FROM members GROUP BY 1`,
+      )
+      .all<{ status: string; n: number }>();
     const out: Record<MemberStatus, number> = { active: 0, opted_out: 0, removed: 0 };
-    for (const r of results) out[r.status] = r.n;
+    for (const r of results) if (r.status in out) out[r.status as MemberStatus] = r.n;
     return out;
   }
 
@@ -142,16 +168,17 @@ export class Store {
     segments: number,
     encoding: string,
     nowIso: string,
+    sourceMessageId: string,
   ): Promise<{ jobId: number; recipients: number }> {
     // D1 runs a batch as one transaction with no other writer in between,
     // so the job just inserted is MAX(id).
     const [job, recipients] = await this.db.batch([
       this.db
         .prepare(
-          `INSERT INTO jobs (kind, admin_phone, body, status, segments, encoding, created_at)
-           VALUES ('blast', ?, ?, 'queued', ?, ?, ?)`,
+          `INSERT INTO jobs (kind, admin_phone, body, status, segments, encoding, created_at, source_message_id)
+           VALUES ('blast', ?, ?, 'queued', ?, ?, ?, ?)`,
         )
-        .bind(adminPhone, body, segments, encoding, nowIso),
+        .bind(adminPhone, body, segments, encoding, nowIso, sourceMessageId),
       this.db.prepare(
         "INSERT INTO job_recipients (job_id, phone) SELECT (SELECT MAX(id) FROM jobs), phone FROM members WHERE status = 'active'",
       ),
@@ -162,6 +189,15 @@ export class Store {
       ),
     ]);
     return { jobId: Number(job.meta.last_row_id), recipients: recipients.meta.changes ?? 0 };
+  }
+
+  /** Whether a blast from this admin message was saved (used after an unclear database error). */
+  async blastExistsFor(sourceMessageId: string): Promise<boolean> {
+    const r = await this.db
+      .prepare("SELECT 1 AS x FROM jobs WHERE source_message_id = ? AND status != 'done'")
+      .bind(sourceMessageId)
+      .first();
+    return r !== null;
   }
 
   /** Number of jobs ahead of this one (sending or queued earlier). */
@@ -177,8 +213,19 @@ export class Store {
     return this.db.prepare("SELECT * FROM jobs WHERE status = 'sending' ORDER BY id LIMIT 1").first<Job>();
   }
 
-  getOldestQueuedJob(): Promise<Job | null> {
-    return this.db.prepare("SELECT * FROM jobs WHERE status = 'queued' ORDER BY id LIMIT 1").first<Job>();
+  /**
+   * The blast #cancel should stop: the one still sending texts, else the next
+   * one waiting. A blast whose texts have all gone out (it's only waiting for
+   * delivery reports or its summary) is left alone.
+   */
+  getCancellableJob(): Promise<Job | null> {
+    return this.db
+      .prepare(
+        `SELECT * FROM jobs WHERE status IN ('sending', 'queued')
+           AND EXISTS (SELECT 1 FROM job_recipients WHERE job_id = jobs.id AND status IN ('pending', 'sending'))
+         ORDER BY (status = 'sending') DESC, id LIMIT 1`,
+      )
+      .first<Job>();
   }
 
   async countQueued(): Promise<number> {
@@ -269,13 +316,6 @@ export class Store {
     await this.db.batch([
       this.db
         .prepare(
-          `UPDATE job_recipients SET status = 'skipped', error = 'not active'
-           WHERE job_id = ? AND status = 'pending'
-             AND phone NOT IN (SELECT phone FROM members WHERE status = 'active')`,
-        )
-        .bind(jobId),
-      this.db
-        .prepare(
           `UPDATE job_recipients SET status = 'failed', error = 'interrupted; not resent'
            WHERE job_id = ?1 AND status = 'sending' AND claimed_at < ?2
              AND phone = (SELECT MIN(r2.phone) FROM job_recipients r2
@@ -285,6 +325,22 @@ export class Store {
       this.db
         .prepare("UPDATE job_recipients SET status = 'pending', claimed_at = NULL WHERE job_id = ? AND status = 'sending' AND claimed_at < ?")
         .bind(jobId, staleBeforeIso),
+      // After the recovery above, so a recovered recipient who was removed meanwhile is skipped too.
+      this.db
+        .prepare(
+          `UPDATE job_recipients SET status = 'skipped', error = 'not active'
+           WHERE job_id = ? AND status = 'pending'
+             AND phone NOT IN (SELECT phone FROM members WHERE status = 'active')`,
+        )
+        .bind(jobId),
+      // A welcome job never welcomes someone twice (e.g. the admin #added him meanwhile).
+      this.db
+        .prepare(
+          `UPDATE job_recipients SET status = 'skipped', error = 'already welcomed'
+           WHERE job_id = ?1 AND status = 'pending' AND (SELECT kind FROM jobs WHERE id = ?1) = 'welcome'
+             AND phone IN (SELECT phone FROM members WHERE welcomed_at IS NOT NULL)`,
+        )
+        .bind(jobId),
     ]);
   }
 
@@ -365,6 +421,11 @@ export class Store {
   async firstHelpToday(phone: string, day: string): Promise<boolean> {
     const r = await this.db.prepare("INSERT OR IGNORE INTO help_replies (phone, day) VALUES (?, ?)").bind(phone, day).run();
     return (r.meta.changes ?? 0) > 0;
+  }
+
+  /** Lets him ask again today (used when the HELP reply failed to send). */
+  async forgetHelp(phone: string, day: string): Promise<void> {
+    await this.db.prepare("DELETE FROM help_replies WHERE phone = ? AND day = ?").bind(phone, day).run();
   }
 
   // ---- daily cap ----

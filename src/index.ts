@@ -59,10 +59,10 @@ export default {
   async fetch(req: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
     return handleFetch(req, env, ctx, makeDeps(env));
   },
-  async scheduled(_controller: ScheduledController, env: Env, ctx: ExecutionContext): Promise<void> {
+  async scheduled(controller: ScheduledController, env: Env, ctx: ExecutionContext): Promise<void> {
     const deps = makeDeps(env);
     ctx.waitUntil(
-      runSender(loadConfig(env), deps)
+      runSender(loadConfig(env), deps, controller.scheduledTime)
         .then((result) => {
           if (result !== "idle") log("sender_run", { result });
         })

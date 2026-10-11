@@ -19,7 +19,8 @@ export interface ParseResult {
 
 // A US phone number written any common way.
 export const PHONE_RE = /(?<![\d+])(?:\+?1[\s.\-]*)?\(?\d{3}\)?[\s.\-]*\d{3}[\s.\-]*\d{4}(?!\d)/g;
-const EXTENSION_RE = /\s*(?:ext\.?|extension|x)\s*\d{1,6}\b/i;
+// An extension written right after the number: "212-555-1234 ext 12", "x12".
+const EXTENSION_AFTER_RE = /^\s*(?:ext\.?|extension|x)\s*\d{1,6}\b/i;
 const TOLL_FREE = new Set(["800", "833", "844", "855", "866", "877", "888"]);
 
 export function parseMemberList(input: string): ParseResult {
@@ -67,12 +68,13 @@ export function parseMemberList(input: string): ParseResult {
         return;
       }
 
-      let rest = text;
-      for (const m of matches) rest = rest.replace(m[0], " ");
-      if (EXTENSION_RE.test(rest)) {
+      const after = text.slice((matches[0].index ?? 0) + matches[0][0].length);
+      if (EXTENSION_AFTER_RE.test(after)) {
         flags.push({ line, text, problem: "has an extension, so probably not a cell phone; skipped" });
         return;
       }
+      let rest = text;
+      for (const m of matches) rest = rest.replace(m[0], " ");
       const name = cleanName(rest);
       if (/\d/.test(name)) flags.push({ line, text, problem: `name has numbers in it ("${name}"); check it` });
       if (seen.has(phone)) {
@@ -99,13 +101,13 @@ function cleanName(s: string): string {
 
 /** Hides all but the last 4 digits of every phone number in a line, for printing. */
 export function maskLine(text: string): string {
-  return text
-    .replace(PHONE_RE, (m) => `…${m.replace(/\D/g, "").slice(-4)}`)
-    .replace(/\d[\d\s().\-]*\d/g, (run) => {
-      // Any other run of 5+ digits (a malformed number) keeps only its last 4.
-      const digits = run.replace(/\D/g, "");
-      return digits.length >= 5 ? `…${digits.slice(-4)}` : run;
-    });
+  // One pass, so masked output is never re-scanned: a US number written any
+  // common way, or any other run of digits joined by short non-letter separators.
+  const re = new RegExp(`${PHONE_RE.source}|\\d(?:[^\\p{L}\\d…]{0,3}\\d)+`, "gu");
+  return text.replace(re, (run) => {
+    const digits = run.replace(/\D/g, "");
+    return digits.length >= 5 ? `…${digits.slice(-4)}` : run;
+  });
 }
 
 export function toCsv(rows: { name: string; phone: string }[]): string {

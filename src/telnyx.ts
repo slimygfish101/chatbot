@@ -22,11 +22,17 @@ export async function sendSms(cfg: Config, fetchFn: FetchFn, to: string, text: s
       method: "POST",
       headers: { Authorization: `Bearer ${cfg.apiKey}`, "Content-Type": "application/json" },
       body: JSON.stringify({ from: cfg.number, to, text, type: "SMS" }),
-      // A hung request becomes a retryable error instead of stalling the whole batch.
-      signal: AbortSignal.timeout(10_000),
+      // A hung request can't stall the batch. 15 texts × 15s stays inside the sender's 5-minute lock.
+      signal: AbortSignal.timeout(15_000),
     });
   } catch (e) {
-    return { ok: false, retryable: true, optedOut: false, error: `network: ${(e as Error).message}` };
+    const name = (e as Error)?.name;
+    if (name === "TimeoutError" || name === "AbortError") {
+      // Telnyx may have accepted it and just answered slowly. Never resend.
+      return { ok: false, retryable: false, optedOut: false, error: "timeout: may have been sent" };
+    }
+    // Couldn't reach Telnyx at all, so nothing was sent: safe to retry.
+    return { ok: false, retryable: true, optedOut: false, error: `network: ${(e as Error)?.message}` };
   }
 
   let body: any = null;

@@ -17,8 +17,8 @@ Replies from boys are ignored, except:
 
 | A boy texts | What happens |
 |---|---|
-| STOP, STOPALL, UNSUBSCRIBE, CANCEL, END or QUIT | He's taken off the list and can't be re-added by the admin or an import. This is recorded even for numbers not on the list. Telnyx sends him the "you're unsubscribed" confirmation. |
-| START or UNSTOP | He goes back to where he was before STOP: on the list if he was on it, otherwise not. Nobody new can join this way. |
+| STOP, STOPALL, UNSUBSCRIBE, CANCEL, END or QUIT | He's taken off the list and is never texted again, even if the admin `#add`s him or he's in an imported list. This is recorded even for numbers not on the list. Telnyx sends him the "you're unsubscribed" confirmation. |
+| START or UNSTOP | He's back on the list if he was on it before STOP, or if the admin `#add`ed him (or he was imported) after STOP. Otherwise, or if the admin `#remove`d him, he stays off. Nobody new can join this way. |
 | HELP or INFO | He gets: "[Group] announcements from [Admin]. Reply STOP to opt out." (at most once a day per number) |
 
 ## Everyday tasks
@@ -43,8 +43,8 @@ All of these are run by Claude Code (or anyone) from this folder. You never need
 - **Pacing:** batches are at least a minute apart, so the 15-a-minute carrier limit is never exceeded.
 - **One at a time:** a second blast waits until the first one finishes. `#cancel` stops the one sending (between texts), or the next one waiting if nothing is sending.
 - **Daily cap:** at most `MAX_TEXTS_PER_DAY` texts a day (default 1000; a long message counts as 2–3). If it's reached, sending pauses, the admin is told once, and the rest goes out after midnight. `#cancel` stops it. HELP replies never go past the cap.
-- **Retries:** if Telnyx is busy (429), has an error (5xx) or doesn't answer within 10 seconds, that boy is retried after 30s, 60s and 120s. After 4 tries he's counted as failed. The summary is retried too.
-- **Errors:** if something fails before a blast is saved, the admin gets "Not sent because of a system error. Please send it again."
+- **Retries:** if Telnyx is busy (429), has an error (5xx) or can't be reached, that boy is retried after 30s, 60s and 120s. After 4 tries he's counted as failed. If Telnyx doesn't answer within 15 seconds, the text may already have gone out, so it's counted as failed and never resent. The summary is retried too.
+- **Errors:** if the database fails before a blast is saved, the admin gets "Not sent because of a system error. Please send it again." The program first checks whether the blast was saved after all, so a resend can't double it. If a #command hits an error, the reply says it may or may not have worked.
 - **DRY_RUN:** logs what would be sent and sends nothing. It's on by default, and stays on unless set to exactly `"false"`. Dry runs don't use up the daily cap or count as anyone's welcome text.
 - **Opt-outs win:** someone who texted STOP is never texted again, even if the admin `#add`s him or he's in an imported list.
 - **No media:** only the words of a message are ever sent, never pictures.

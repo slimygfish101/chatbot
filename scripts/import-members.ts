@@ -25,7 +25,7 @@ writeFileSync(cleanPath, toCsv(rows));
 console.log(`\n${rows.length} members ready. Clean list saved to setup/members.clean.csv`);
 if (flags.length) {
   console.log(`\n${flags.length} line(s) need a look:`);
-  for (const f of flags) console.log(`  line ${f.line}: ${f.problem}\n      ${maskLine(f.text)}`);
+  for (const f of flags) console.log(`  line ${f.line}: ${maskLine(f.problem)}\n      ${maskLine(f.text)}`);
 }
 
 if (!args.includes("--apply")) {

@@ -7,7 +7,7 @@ export const sql = (v: string | null | undefined) => (v == null ? "NULL" : `'${S
 /**
  * - New numbers are added as active.
  * - Existing names are updated; a member the admin removed is re-activated.
- * - Anyone who texted STOP stays opted out.
+ * - Anyone who texted STOP stays opted out; if he texts START he's on the list.
  * - With a welcome body: one welcome job for listed members who are active,
  *   never welcomed, and not already waiting in another welcome job.
  */
@@ -18,6 +18,7 @@ export function buildImportSql(rows: { name: string; phone: string }[], nowIso: 
        ON CONFLICT(phone) DO UPDATE SET
          name = CASE WHEN excluded.name = '' THEN members.name ELSE excluded.name END,
          status = CASE WHEN members.status = 'removed' THEN 'active' ELSE members.status END,
+         status_before_optout = CASE WHEN members.status = 'opted_out' THEN 'active' ELSE members.status_before_optout END,
          updated_at = excluded.updated_at;`,
   );
   if (welcomeBody && rows.length) {

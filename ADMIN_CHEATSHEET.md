@@ -19,7 +19,7 @@ Text the group number like a normal text. **Anything that doesn't start with `#`
 
 **Good to know**
 
-- If you send a second message while one is still going out, it waits its turn and goes out right after.
+- If you send a second message while one is still going out, it waits its turn and goes out right after. If that second one was a mistake, text `#cancel` right away.
 - Boys can't reply to everyone. Their replies are ignored, except STOP (takes them off the list) and HELP.
-- A boy who texted STOP can't be re-added with `#add`. He has to text START to the group number himself.
+- If you `#add` a boy who once texted STOP, he isn't texted. He joins the list as soon as he texts START to the group number himself.
 - Spelling matters after the `#`, and put a space before the number. A wrong command is never sent to the boys; you'll get "Unknown command".
