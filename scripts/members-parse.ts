@@ -20,7 +20,7 @@ export interface ParseResult {
 // A US phone number written any common way.
 export const PHONE_RE = /(?<![\d+])(?:\+?1[\s.\-]*)?\(?\d{3}\)?[\s.\-]*\d{3}[\s.\-]*\d{4}(?!\d)/g;
 // An extension written right after the number: "212-555-1234 ext 12", "x12".
-const EXTENSION_AFTER_RE = /^\s*(?:ext\.?|extension|x)\s*\d{1,6}\b/i;
+const EXTENSION_AFTER_RE = /^[\s,;:(\-]*(?:ext\.?|extension|x)\s*\d{1,6}\b/i;
 const TOLL_FREE = new Set(["800", "833", "844", "855", "866", "877", "888"]);
 
 export function parseMemberList(input: string): ParseResult {

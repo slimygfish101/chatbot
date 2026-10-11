@@ -11,7 +11,12 @@ export const sql = (v: string | null | undefined) => (v == null ? "NULL" : `'${S
  * - With a welcome body: one welcome job for listed members who are active,
  *   never welcomed, and not already waiting in another welcome job.
  */
-export function buildImportSql(rows: { name: string; phone: string }[], nowIso: string, welcomeBody?: string): string[] {
+export function buildImportSql(
+  rows: { name: string; phone: string }[],
+  nowIso: string,
+  welcomeBody: string | undefined,
+  dryRun: boolean,
+): string[] {
   const statements = rows.map(
     (r) =>
       `INSERT INTO members (phone, name, status, added_at, updated_at) VALUES (${sql(r.phone)}, ${sql(r.name)}, 'active', ${sql(nowIso)}, ${sql(nowIso)})
@@ -25,8 +30,8 @@ export function buildImportSql(rows: { name: string; phone: string }[], nowIso: 
     const seg = countSegments(welcomeBody);
     const phones = rows.map((r) => sql(r.phone)).join(",");
     statements.push(
-      `INSERT INTO jobs (kind, admin_phone, body, status, segments, encoding, created_at)
-       VALUES ('welcome', NULL, ${sql(welcomeBody)}, 'draft', ${seg.segments}, ${sql(seg.encoding)}, ${sql(nowIso)});`,
+      `INSERT INTO jobs (kind, admin_phone, body, status, segments, encoding, created_at, dry_run)
+       VALUES ('welcome', NULL, ${sql(welcomeBody)}, 'draft', ${seg.segments}, ${sql(seg.encoding)}, ${sql(nowIso)}, ${dryRun ? 1 : 0});`,
       `INSERT INTO job_recipients (job_id, phone) SELECT (SELECT MAX(id) FROM jobs WHERE kind = 'welcome' AND status = 'draft'), phone
        FROM members WHERE status = 'active' AND welcomed_at IS NULL AND phone IN (${phones})
        AND phone NOT IN (SELECT r.phone FROM job_recipients r JOIN jobs j ON j.id = r.job_id

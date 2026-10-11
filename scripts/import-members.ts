@@ -40,7 +40,9 @@ if (args.includes("--welcome") && rows.length) {
   if (!cfg.groupName || cfg.groupName.startsWith("REPLACE")) die("Set GROUP_NAME/ADMIN_NAME first (npm run deploy does it).");
   welcomeBody = welcomeText(cfg);
 }
-const statements = buildImportSql(rows, now, welcomeBody);
+// The welcome job runs in the mode the deployed program is in (DRY_RUN in wrangler.toml).
+const dryRun = !["false", "0", "no", "off"].includes((tomlVar("DRY_RUN") ?? "").trim().toLowerCase());
+const statements = buildImportSql(rows, now, welcomeBody, dryRun);
 
 // The SQL holds phone numbers, so it lives only briefly in a private temp folder.
 const tmpDir = mkdtempSync(join(tmpdir(), "textblast-import-"));

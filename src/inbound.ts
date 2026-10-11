@@ -198,7 +198,8 @@ async function handleAdmin(
         const c = await store.jobCounts(job.id);
         const queued = await store.countQueued();
         const parts = [`Cancelled "${preview(job.body)}". ${c.sent} of ${c.total} had already been sent.`];
-        if (c.inFlight) parts.push(`Up to ${c.inFlight} more were already on their way.`);
+        // The sender checks for #cancel after every text, so at most the one in flight still goes out.
+        if (c.inFlight) parts.push("One more may have gone out.");
         if (queued) parts.push(`${queued} waiting message(s) will go out next.`);
         await reply(cfg, deps, admin, parts.join(" "));
         break;
@@ -209,7 +210,7 @@ async function handleAdmin(
 
   // Anything else is a blast.
   const seg = countSegments(text);
-  const { jobId, recipients } = await store.createBlastJob(admin, text, seg.segments, seg.encoding, nowIso, messageId);
+  const { jobId, recipients } = await store.createBlastJob(admin, text, seg.segments, seg.encoding, nowIso, messageId, cfg.dryRun);
   log("blast_created", { job: jobId, recipients, segments: seg.segments, encoding: seg.encoding, dryRun: cfg.dryRun });
   if (recipients === 0) {
     await reply(cfg, deps, admin, "Not sent: there are no active members on the list.");

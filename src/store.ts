@@ -19,6 +19,8 @@ export interface Job {
   cap_notice_day: string | null;
   summary_attempts: number;
   finish_waits: number;
+  /** 1 = created in test mode, 0 = live, null = before this was recorded. */
+  dry_run: number | null;
 }
 export interface JobCounts {
   total: number;
@@ -169,16 +171,17 @@ export class Store {
     encoding: string,
     nowIso: string,
     sourceMessageId: string,
+    dryRun: boolean,
   ): Promise<{ jobId: number; recipients: number }> {
     // D1 runs a batch as one transaction with no other writer in between,
     // so the job just inserted is MAX(id).
     const [job, recipients] = await this.db.batch([
       this.db
         .prepare(
-          `INSERT INTO jobs (kind, admin_phone, body, status, segments, encoding, created_at, source_message_id)
-           VALUES ('blast', ?, ?, 'queued', ?, ?, ?, ?)`,
+          `INSERT INTO jobs (kind, admin_phone, body, status, segments, encoding, created_at, source_message_id, dry_run)
+           VALUES ('blast', ?, ?, 'queued', ?, ?, ?, ?, ?)`,
         )
-        .bind(adminPhone, body, segments, encoding, nowIso, sourceMessageId),
+        .bind(adminPhone, body, segments, encoding, nowIso, sourceMessageId, dryRun ? 1 : 0),
       this.db.prepare(
         "INSERT INTO job_recipients (job_id, phone) SELECT (SELECT MAX(id) FROM jobs), phone FROM members WHERE status = 'active'",
       ),
@@ -214,8 +217,9 @@ export class Store {
   }
 
   /**
-   * The blast #cancel should stop: the one still sending texts, else the next
-   * one waiting. A blast whose texts have all gone out (it's only waiting for
+   * The message #cancel should stop: the most recent one that still has texts
+   * to send ("undo my last message"). Texting #cancel again stops the one
+   * before it. A message whose texts have all gone out (only waiting for
    * delivery reports or its summary) is left alone.
    */
   getCancellableJob(): Promise<Job | null> {
@@ -223,7 +227,7 @@ export class Store {
       .prepare(
         `SELECT * FROM jobs WHERE status IN ('sending', 'queued')
            AND EXISTS (SELECT 1 FROM job_recipients WHERE job_id = jobs.id AND status IN ('pending', 'sending'))
-         ORDER BY (status = 'sending') DESC, id LIMIT 1`,
+         ORDER BY id DESC LIMIT 1`,
       )
       .first<Job>();
   }
@@ -435,8 +439,9 @@ export class Store {
     return r?.count ?? 0;
   }
 
+  /** Adds to (or, with a negative n, gives back to) the day's text count. */
   async addDailyCount(day: string, n: number): Promise<void> {
-    if (n <= 0) return;
+    if (n === 0) return;
     await this.db
       .prepare("INSERT INTO daily_counts (day, count) VALUES (?1, ?2) ON CONFLICT(day) DO UPDATE SET count = count + ?2")
       .bind(day, n)

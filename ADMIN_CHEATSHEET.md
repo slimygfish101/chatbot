@@ -8,7 +8,7 @@ Text the group number like a normal text. **Anything that doesn't start with `#`
 | `#add 2125551234 Moshe` | Adds Moshe and sends him the welcome text |
 | `#remove 2125551234` | Takes that boy off the list |
 | `#count` | Tells you how many boys are on the list |
-| `#cancel` | Stops a message that's still going out (or one that's waiting its turn) |
+| `#cancel` | Stops your most recent message that hasn't finished going out. Text it again to stop the one before. |
 | `#help` | Texts you this list |
 
 **Three rules**

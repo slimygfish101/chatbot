@@ -1,5 +1,5 @@
 import type { Config } from "./config";
-import type { Deps } from "./inbound";
+import { preview, type Deps } from "./inbound";
 import { log } from "./log";
 import { mask } from "./phone";
 import { countSegments } from "./segments";
@@ -92,6 +92,19 @@ export async function runSender(cfg: Config, deps: Deps, scheduledMs?: number): 
     const job = (await store.getSendingJob()) ?? (await store.startNextQueued(nowIso));
     if (!job) return "idle";
 
+    // Never let a test-mode blast turn real (or a real one turn into a test) halfway.
+    if (job.dry_run !== null && Boolean(job.dry_run) !== cfg.dryRun) {
+      await store.cancelJob(job.id, nowIso);
+      await store.skipUnsentClaims(job.id);
+      const admin = adminFor(cfg, job);
+      const mode = job.dry_run ? "test mode" : "live mode";
+      if (admin) {
+        await sendAndCount(cfg, deps, admin, `Stopped "${preview(job.body)}": it was started in ${mode} and the mode has changed. Send it again if needed.`, dayKey(now, cfg.timezone));
+      }
+      log("job_mode_changed", { job: job.id, jobDryRun: job.dry_run, dryRun: cfg.dryRun });
+      return "mode_changed";
+    }
+
     await store.tidyRecipients(job.id, new Date(now.getTime() - STALE_CLAIM_MS).toISOString());
 
     const day = dayKey(now, cfg.timezone);
@@ -120,6 +133,9 @@ export async function runSender(cfg: Config, deps: Deps, scheduledMs?: number): 
       // Phone order matters: tidyRecipients relies on it after a crash.
       const due = (await store.claimDue(job.id, limit, nowIso)).sort((a, b) => (a.phone < b.phone ? -1 : 1));
       sentBatch = due.length > 0;
+      // Count the whole batch against the daily cap up front and give back what
+      // didn't go out at the end, so a run cut off mid-batch never under-counts.
+      if (!cfg.dryRun) await store.addDailyCount(day, due.length * job.segments);
       let accepted = 0;
       for (const r of due) {
         const res = await sendSms(cfg, deps.fetch, r.phone, job.body);
@@ -135,7 +151,7 @@ export async function runSender(cfg: Config, deps: Deps, scheduledMs?: number): 
         }
       }
       if (!cfg.dryRun) {
-        await store.addDailyCount(day, accepted * job.segments);
+        await store.addDailyCount(day, (accepted - due.length) * job.segments);
         if (job.kind === "welcome") await store.markWelcomedFromJob(job.id, nowIso);
       }
       if (due.length) log("batch_sent", { job: job.id, tried: due.length, accepted, dryRun: cfg.dryRun });

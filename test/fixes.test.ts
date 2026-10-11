@@ -77,7 +77,7 @@ describe("dry run has no lasting side effects", () => {
   it("a dry-run welcome job doesn't mark anyone welcomed", async () => {
     const s = setup({ DRY_RUN: "true" });
     const rows = [{ name: "A", phone: "+17185551111" }];
-    for (const q of buildImportSql(rows, "2026-10-11T00:00:00Z", "Welcome!")) s.db.sqlite.exec(q);
+    for (const q of buildImportSql(rows, "2026-10-11T00:00:00Z", "Welcome!", s.cfg.dryRun)) s.db.sqlite.exec(q);
     await drain(s);
     expect(s.db.rows("SELECT welcomed_at FROM members")[0].welcomed_at).toBeNull();
   });
@@ -108,7 +108,7 @@ describe("STOP is always recorded", () => {
   it("an imported list does the same for someone who texted STOP", async () => {
     const s = setup();
     await handleInbound(s.cfg, s.deps, inbound("+17185559999", "STOP"));
-    for (const q of buildImportSql([{ name: "Avi", phone: "+17185559999" }], "t")) s.db.sqlite.exec(q);
+    for (const q of buildImportSql([{ name: "Avi", phone: "+17185559999" }], "t", undefined, false)) s.db.sqlite.exec(q);
     expect(status(s, "+17185559999")).toBe("opted_out");
     await handleInbound(s.cfg, s.deps, inbound("+17185559999", "START"));
     expect(status(s, "+17185559999")).toBe("active");
@@ -213,7 +213,7 @@ describe("#cancel", () => {
     };
     expect(await runSender(s.cfg, s.deps)).toBe("cancelled");
     expect(membersSent(s, phones)).toBe(3);
-    expect(s.telnyx.to(ADMIN).map((m) => m.text)).toEqual(['Cancelled "oops". 2 of 10 had already been sent. Up to 8 more were already on their way.']);
+    expect(s.telnyx.to(ADMIN).map((m) => m.text)).toEqual(['Cancelled "oops". 2 of 10 had already been sent. One more may have gone out.']);
     expect(s.db.rows("SELECT status, COUNT(*) AS n FROM job_recipients GROUP BY status ORDER BY status")).toEqual([
       { status: "sent", n: 3 },
       { status: "skipped", n: 7 },
@@ -407,7 +407,7 @@ describe("second review round", () => {
   it("a welcome job skips someone the admin welcomed with #add meanwhile", async () => {
     const s = setup();
     const rows = Array.from({ length: 20 }, (_, i) => ({ name: `B${i}`, phone: `+1718555${String(4000 + i)}` }));
-    for (const q of buildImportSql(rows, "t", "Welcome!")) s.db.sqlite.exec(q);
+    for (const q of buildImportSql(rows, "t", "Welcome!", s.cfg.dryRun)) s.db.sqlite.exec(q);
     await runSender(s.cfg, s.deps); // 15 welcomed
     await handleInbound(s.cfg, s.deps, inbound(ADMIN, "#remove 7185554019"));
     await handleInbound(s.cfg, s.deps, inbound(ADMIN, "#add 7185554019 B19"));
@@ -454,6 +454,76 @@ describe("second review round", () => {
   });
 });
 
+describe("third review round", () => {
+  it("#cancel stops the most recent message (the mistake), and the real one still goes to everyone", async () => {
+    const s = setup();
+    const phones = addMembers(s.db, 30);
+    await handleInbound(s.cfg, s.deps, inbound(ADMIN, "Real announcement"));
+    await runSender(s.cfg, s.deps); // 15 of 30
+    await handleInbound(s.cfg, s.deps, inbound(ADMIN, "Oops wrong group"));
+    await handleInbound(s.cfg, s.deps, inbound(ADMIN, "#cancel"));
+    expect(s.telnyx.to(ADMIN).at(-1)!.text).toBe('Cancelled "Oops wrong group". 0 of 30 had already been sent.');
+    s.clock.advance(60_000);
+    await drain(s);
+    for (const p of phones) expect(s.telnyx.to(p).map((m) => m.text)).toEqual(["Real announcement"]);
+  });
+
+  it("a second #cancel stops the one before it", async () => {
+    const s = setup();
+    const phones = addMembers(s.db, 30);
+    await handleInbound(s.cfg, s.deps, inbound(ADMIN, "First"));
+    await runSender(s.cfg, s.deps);
+    await handleInbound(s.cfg, s.deps, inbound(ADMIN, "Second"));
+    await handleInbound(s.cfg, s.deps, inbound(ADMIN, "#cancel"));
+    await handleInbound(s.cfg, s.deps, inbound(ADMIN, "#cancel"));
+    expect(s.telnyx.to(ADMIN).at(-1)!.text).toBe('Cancelled "First". 15 of 30 had already been sent.');
+    s.clock.advance(60_000);
+    await drain(s);
+    expect(membersSent(s, phones)).toBe(15);
+  });
+
+  it("a run cut off mid-batch still counts its texts against the daily cap", async () => {
+    const s = setup();
+    addMembers(s.db, 15);
+    await handleInbound(s.cfg, s.deps, inbound(ADMIN, "hi"));
+    let saves = 0;
+    const realSave = s.deps.store.saveResult.bind(s.deps.store);
+    s.deps.store.saveResult = async (...a) => {
+      if (++saves === 10) throw new Error("D1_ERROR: Network connection lost");
+      return realSave(...a);
+    };
+    await expect(runSender(s.cfg, s.deps)).rejects.toThrow();
+    const counted = s.db.rows("SELECT SUM(count) AS n FROM daily_counts")[0].n;
+    expect(counted).toBeGreaterThanOrEqual(10); // 10 really went out
+  });
+
+  it("a finished batch gives back the cap for texts that didn't go out", async () => {
+    const s = setup();
+    addMembers(s.db, 3);
+    s.telnyx.respond = (to) => (to === "+13475551000" ? { status: 422, body: {} } : null);
+    await handleInbound(s.cfg, s.deps, inbound(ADMIN, "hi"));
+    await runSender(s.cfg, s.deps);
+    expect(s.db.rows("SELECT SUM(count) AS n FROM daily_counts")[0].n).toBe(2);
+  });
+
+  it("a test-mode blast is stopped, not sent for real, if test mode is turned off midway", async () => {
+    const dry = setup({ DRY_RUN: "true" });
+    const phones = addMembers(dry.db, 30);
+    await handleInbound(dry.cfg, dry.deps, inbound(ADMIN, "Test 1"));
+    await runSender(dry.cfg, dry.deps); // 15 "sent" in test mode
+    // The owner goes live while it's still going.
+    const live = { ...dry, cfg: { ...dry.cfg, dryRun: false } };
+    dry.clock.advance(60_000);
+    expect(await runSender(live.cfg, live.deps)).toBe("mode_changed");
+    expect(dry.telnyx.sent.filter((m) => phones.includes(m.to))).toHaveLength(0);
+    expect(dry.telnyx.to(ADMIN).map((m) => m.text)).toEqual([
+      'Stopped "Test 1": it was started in test mode and the mode has changed. Send it again if needed.',
+    ]);
+    dry.clock.advance(60_000);
+    expect(await runSender(live.cfg, live.deps)).toBe("idle");
+  });
+});
+
 describe("import SQL", () => {
   it("adds, renames, re-activates removed, keeps opted-out, survives quotes", async () => {
     const s = setup();
@@ -465,7 +535,7 @@ describe("import SQL", () => {
       { name: "", phone: "+17185550003" },
       { name: "O'Brien \"Sam\"", phone: "+17185550004" },
     ];
-    for (const q of buildImportSql(rows, "2026-10-11T00:00:00Z")) s.db.sqlite.exec(q);
+    for (const q of buildImportSql(rows, "2026-10-11T00:00:00Z", undefined, false)) s.db.sqlite.exec(q);
     expect(s.db.rows("SELECT phone, name, status FROM members ORDER BY phone")).toEqual([
       { phone: "+17185550001", name: "Re'added", status: "active" },
       { phone: "+17185550002", name: "Out", status: "opted_out" },
@@ -477,10 +547,10 @@ describe("import SQL", () => {
   it("welcome: only active, not yet welcomed; marked welcomed batch by batch; re-import mid-send doesn't double", async () => {
     const s = setup();
     const rows = Array.from({ length: 20 }, (_, i) => ({ name: `B${i}`, phone: `+1718555${String(2000 + i)}` }));
-    for (const q of buildImportSql(rows, "t", "Welcome!")) s.db.sqlite.exec(q);
+    for (const q of buildImportSql(rows, "t", "Welcome!", s.cfg.dryRun)) s.db.sqlite.exec(q);
     await runSender(s.cfg, s.deps); // first 15
     expect(s.db.rows("SELECT COUNT(*) AS n FROM members WHERE welcomed_at IS NOT NULL")[0].n).toBe(15);
-    for (const q of buildImportSql(rows, "t2", "Welcome!")) s.db.sqlite.exec(q); // owner re-runs the import
+    for (const q of buildImportSql(rows, "t2", "Welcome!", s.cfg.dryRun)) s.db.sqlite.exec(q); // owner re-runs the import
     expect(s.db.rows("SELECT id, status FROM jobs ORDER BY id")).toEqual([
       { id: 1, status: "sending" },
       { id: 2, status: "done" }, // nobody new to welcome
@@ -506,6 +576,12 @@ describe("member list parser edge cases", () => {
     const r = parseMemberList("Alex\t2125551234\t9\nMax Cox 212-555-1235 12\n2125551236 Felix 10\nAlex 11 718-555-1237");
     expect(r.rows.map((x) => x.phone)).toEqual(["+12125551234", "+12125551235", "+12125551236", "+17185551237"]);
     expect(r.flags.every((f) => !f.problem.includes("extension"))).toBe(true);
+  });
+
+  it("extensions after a comma, dash or in parentheses are caught too", () => {
+    const r = parseMemberList("Office 212-555-7000, ext. 5\nShul 212-555-7001 (x12)\nDesk 212-555-7002 - ext 3");
+    expect(r.rows).toEqual([]);
+    expect(r.flags.every((f) => f.problem.includes("extension"))).toBe(true);
   });
 
   it("numbers with an extension are skipped as not-a-cell", () => {
@@ -550,7 +626,7 @@ describe("Cloudflare free plan: at most 50 subrequests per run", () => {
   it("a welcome-job batch", async () => {
     const s = setup();
     const rows = Array.from({ length: 30 }, (_, i) => ({ name: `B${i}`, phone: `+1718555${String(3000 + i)}` }));
-    for (const q of buildImportSql(rows, "t", "Welcome!")) s.db.sqlite.exec(q);
+    for (const q of buildImportSql(rows, "t", "Welcome!", s.cfg.dryRun)) s.db.sqlite.exec(q);
     const used = await measure(s, () => runSender(s.cfg, s.deps));
     expect(used).toBeLessThanOrEqual(50);
   });
