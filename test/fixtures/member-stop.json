@@ -1,0 +1,19 @@
+{
+  "data": {
+    "event_type": "message.received",
+    "id": "e6b1a7a2-2b53-4a9c-8f3f-5f1d0f9c2b10",
+    "occurred_at": "2026-10-11T14:10:00.000+00:00",
+    "payload": {
+      "direction": "inbound",
+      "from": { "carrier": "T-Mobile USA, Inc.", "line_type": "Wireless", "phone_number": "+13475551000" },
+      "id": "a7f0c2d1-6e4b-4b8a-9c3d-1e2f3a4b5c6d",
+      "media": [],
+      "record_type": "message",
+      "text": "Stop",
+      "to": [{ "phone_number": "+12125550000", "status": "webhook_delivered" }],
+      "type": "SMS"
+    },
+    "record_type": "event"
+  },
+  "meta": { "attempt": 1 }
+}

@@ -1,0 +1,20 @@
+{
+  "data": {
+    "event_type": "message.received",
+    "id": "0f6a3a0e-0c1e-4c38-9bd4-2f1b7c0c9e11",
+    "occurred_at": "2026-10-11T14:05:00.000+00:00",
+    "payload": {
+      "direction": "inbound",
+      "from": { "carrier": "Verizon Wireless", "line_type": "Wireless", "phone_number": "+12125550001" },
+      "id": "5a1d9c4e-3b7f-4f61-a0f5-8f2c4d9b7e21",
+      "media": [{ "content_type": "text/plain", "hash_sha256": "abc", "size": 412, "url": "https://media.telnyx.example/part1.txt" }],
+      "parts": 1,
+      "record_type": "message",
+      "text": "Reminder: the trip on Sunday leaves from the main entrance at 7:30am sharp. Bring water, a hat, lunch and a jacket. Parents must sign the form by Thursday or you can't come. Questions go to the office.",
+      "to": [{ "phone_number": "+12125550000", "status": "webhook_delivered" }],
+      "type": "MMS"
+    },
+    "record_type": "event"
+  },
+  "meta": { "attempt": 1 }
+}

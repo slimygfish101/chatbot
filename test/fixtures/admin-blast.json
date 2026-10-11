@@ -1,0 +1,34 @@
+{
+  "data": {
+    "event_type": "message.received",
+    "id": "b301ed3f-1490-491f-995f-6e64e69674d4",
+    "occurred_at": "2026-10-11T14:00:00.000+00:00",
+    "payload": {
+      "cc": [],
+      "completed_at": null,
+      "cost": null,
+      "direction": "inbound",
+      "encoding": "GSM-7",
+      "errors": [],
+      "from": { "carrier": "Verizon Wireless", "line_type": "Wireless", "phone_number": "+12125550001" },
+      "id": "84cca175-9755-4859-b67f-4730d7f58aa3",
+      "media": [],
+      "messaging_profile_id": "740572b6-099c-44a1-89b9-6c92163bc68d",
+      "organization_id": "47a530f8-4362-4526-829b-bcee17fd9f7a",
+      "parts": 1,
+      "received_at": "2026-10-11T14:00:00.000+00:00",
+      "record_type": "message",
+      "sent_at": null,
+      "subject": "",
+      "tags": [],
+      "text": "Shiur is moved to 8pm tonight.",
+      "to": [{ "carrier": "Telnyx", "line_type": "Wireless", "phone_number": "+12125550000", "status": "webhook_delivered" }],
+      "type": "SMS",
+      "valid_until": null,
+      "webhook_failover_url": null,
+      "webhook_url": "https://text-blast.example.workers.dev/telnyx"
+    },
+    "record_type": "event"
+  },
+  "meta": { "attempt": 1, "delivered_to": "https://text-blast.example.workers.dev/telnyx" }
+}

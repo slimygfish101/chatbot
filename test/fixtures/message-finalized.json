@@ -1,0 +1,18 @@
+{
+  "data": {
+    "event_type": "message.finalized",
+    "id": "7c0e0f5e-6a3b-4f0d-b1c2-9d8e7f6a5b4c",
+    "occurred_at": "2026-10-11T14:01:05.000+00:00",
+    "payload": {
+      "direction": "outbound",
+      "from": { "phone_number": "+12125550000" },
+      "id": "msg-1",
+      "record_type": "message",
+      "text": "Shiur is moved to 8pm tonight.",
+      "to": [{ "phone_number": "+13475551000", "status": "delivered" }],
+      "type": "SMS"
+    },
+    "record_type": "event"
+  },
+  "meta": { "attempt": 1 }
+}

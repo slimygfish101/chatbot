@@ -1,0 +1,5 @@
+# Copy to .dev.vars for `npm run dev` (local testing only). Never commit .dev.vars.
+TELNYX_API_KEY=KEYxxxxxxxx
+TELNYX_PUBLIC_KEY=base64-public-key-from-telnyx-portal
+TELNYX_NUMBER=+12125550000
+ADMIN_NUMBERS=+12125550001

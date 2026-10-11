@@ -1,0 +1,19 @@
+{
+  "groupName": "Yeshiva Boys",
+  "adminName": "Rabbi Cohen",
+  "schoolName": "Yeshiva Example",
+  "adminNumbers": ["+12125550001"],
+  "ownerNumber": "+12125550002",
+  "areaCode": "718",
+  "telnyxPublicKey": "base64 public key from Telnyx (not a secret)",
+  "brand": {
+    "firstName": "First",
+    "lastName": "Last",
+    "email": "you@example.com",
+    "mobilePhone": "+12125550002",
+    "street": "1 Main St",
+    "city": "Brooklyn",
+    "state": "NY",
+    "postalCode": "11201"
+  }
+}

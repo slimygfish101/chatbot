@@ -1,0 +1,33 @@
+# Settings for the Text Blast program on Cloudflare.
+# Secret values (API key, phone numbers) are NOT kept here. They are set with
+# `npx wrangler secret put NAME`. See README.md.
+name = "text-blast"
+main = "src/index.ts"
+compatibility_date = "2026-09-01"
+
+# Runs the sender once a minute. It sends the next small batch of any blast
+# that's in progress, and does nothing if there isn't one.
+[triggers]
+crons = ["* * * * *"]
+
+[[d1_databases]]
+binding = "DB"
+database_name = "text-blast-db"
+database_id = "REPLACE_WITH_ID_FROM_wrangler_d1_create"
+migrations_dir = "migrations"
+
+[vars]
+GROUP_NAME = "REPLACE_GROUP_NAME"
+ADMIN_NAME = "REPLACE_ADMIN_NAME"
+# Daily cap on texts. Sending pauses (and the admin is told) when reached.
+MAX_TEXTS_PER_DAY = "1000"
+# "true" = log what would be sent instead of sending. Start with this on.
+DRY_RUN = "true"
+# "true" = blasts are saved but nothing goes out until set back to "false".
+PAUSED = "false"
+# Texts sent per minute. Telnyx allows Sole Proprietor numbers about 15/minute.
+SEND_BATCH_SIZE = "15"
+# The "day" for the daily cap starts at midnight in this time zone.
+TIMEZONE = "America/New_York"
+# "true" if Telnyx's own auto-reply to HELP is turned on (then we don't reply too).
+TELNYX_REPLIES_TO_HELP = "false"

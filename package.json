@@ -1,0 +1,29 @@
+{
+  "name": "text-blast",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "vitest run",
+    "typecheck": "tsc --noEmit",
+    "dev": "wrangler dev",
+    "deploy": "tsx scripts/deploy.ts",
+    "logs": "wrangler tail",
+    "db:migrate": "wrangler d1 migrations apply text-blast-db --remote",
+    "db:migrate:local": "wrangler d1 migrations apply text-blast-db --local",
+    "import": "tsx scripts/import-members.ts",
+    "export": "tsx scripts/export-members.ts",
+    "telnyx": "tsx scripts/telnyx.ts",
+    "deploy:only": "wrangler deploy",
+    "report": "tsx scripts/report.ts",
+    "smoke": "tsx scripts/local-smoke.ts"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "^5.20260901.0",
+    "@types/node": "^22.10.0",
+    "tsx": "^4.19.0",
+    "typescript": "^5.9.0",
+    "vitest": "^3.2.0",
+    "wrangler": "^4.40.0"
+  }
+}
