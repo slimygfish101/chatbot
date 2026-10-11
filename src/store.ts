@@ -17,14 +17,26 @@ export interface Job {
   segments: number;
   encoding: string;
   cap_notice_day: string | null;
+  summary_attempts: number;
+  finish_waits: number;
 }
 export interface JobCounts {
   total: number;
+  /** Accepted by Telnyx and not reported undeliverable by the carrier. */
   sent: number;
+  /** Failed to send, or the carrier reported it undeliverable. */
   failed: number;
   skipped: number;
+  /** Still to send (pending) or being sent right now. */
   pending: number;
+  /** Of `pending`, how many are mid-send. */
+  inFlight: number;
+  /** Sent, but no delivery report from the carrier yet. */
+  awaitingReceipt: number;
 }
+
+/** Telnyx's final statuses that mean the text didn't arrive. */
+export const UNDELIVERED = ["sending_failed", "delivery_failed"];
 export type RecipientResult =
   | { phone: string; outcome: "sent"; telnyxId: string }
   | { phone: string; outcome: "retry"; attempts: number; nextAttemptAt: string; error: string }
@@ -42,6 +54,11 @@ export class Store {
       .bind(messageId, nowIso)
       .run();
     return (r.meta.changes ?? 0) > 0;
+  }
+
+  /** Undo markProcessed after a failure, so a resend isn't treated as a duplicate. */
+  async forgetProcessed(messageId: string): Promise<void> {
+    await this.db.prepare("DELETE FROM processed_messages WHERE message_id = ?").bind(messageId).run();
   }
 
   // ---- members ----
@@ -65,12 +82,38 @@ export class Store {
     await this.db.prepare("UPDATE members SET name = ?, updated_at = ? WHERE phone = ?").bind(name, nowIso, phone).run();
   }
 
-  async setStatus(phone: string, status: MemberStatus, nowIso: string, onlyIf?: MemberStatus): Promise<boolean> {
-    const sql = onlyIf
-      ? "UPDATE members SET status = ?, updated_at = ? WHERE phone = ? AND status = ?"
-      : "UPDATE members SET status = ?, updated_at = ? WHERE phone = ?";
-    const stmt = this.db.prepare(sql);
-    const r = await (onlyIf ? stmt.bind(status, nowIso, phone, onlyIf) : stmt.bind(status, nowIso, phone)).run();
+  async setStatus(phone: string, status: MemberStatus, nowIso: string): Promise<void> {
+    await this.db.prepare("UPDATE members SET status = ?, updated_at = ? WHERE phone = ?").bind(status, nowIso, phone).run();
+  }
+
+  /**
+   * Records a STOP from any number, member or not, so nothing (an #add, an
+   * import) can text him again until he texts START himself.
+   */
+  async optOut(phone: string, nowIso: string): Promise<void> {
+    await this.db
+      .prepare(
+        `INSERT INTO members (phone, name, status, added_at, updated_at) VALUES (?1, '', 'opted_out', ?2, ?2)
+         ON CONFLICT(phone) DO UPDATE SET
+           status_before_optout = CASE WHEN members.status = 'opted_out' THEN members.status_before_optout ELSE members.status END,
+           status = 'opted_out', updated_at = ?2`,
+      )
+      .bind(phone, nowIso)
+      .run();
+  }
+
+  /**
+   * START/UNSTOP: puts an opted-out number back where it was before STOP.
+   * A stranger (never on the list) becomes 'removed': allowed to be #added, not on the list.
+   */
+  async optIn(phone: string, nowIso: string): Promise<boolean> {
+    const r = await this.db
+      .prepare(
+        `UPDATE members SET status = COALESCE(status_before_optout, 'removed'), status_before_optout = NULL, updated_at = ?
+         WHERE phone = ? AND status = 'opted_out'`,
+      )
+      .bind(nowIso, phone)
+      .run();
     return (r.meta.changes ?? 0) > 0;
   }
 
@@ -89,7 +132,10 @@ export class Store {
 
   // ---- jobs ----
 
-  /** Creates a blast for every active member. Returns the job id and recipient count. */
+  /**
+   * Creates a blast for every active member, in one transaction (all or nothing).
+   * Returns the job id and recipient count.
+   */
   async createBlastJob(
     adminPhone: string,
     body: string,
@@ -97,24 +143,25 @@ export class Store {
     encoding: string,
     nowIso: string,
   ): Promise<{ jobId: number; recipients: number }> {
-    const job = await this.db
-      .prepare(
-        `INSERT INTO jobs (kind, admin_phone, body, status, segments, encoding, created_at)
-         VALUES ('blast', ?, ?, 'draft', ?, ?, ?) RETURNING id`,
-      )
-      .bind(adminPhone, body, segments, encoding, nowIso)
-      .first<{ id: number }>();
-    const jobId = job!.id;
-    const ins = await this.db
-      .prepare("INSERT INTO job_recipients (job_id, phone) SELECT ?, phone FROM members WHERE status = 'active'")
-      .bind(jobId)
-      .run();
-    const recipients = ins.meta.changes ?? 0;
-    await this.db
-      .prepare("UPDATE jobs SET status = ? WHERE id = ?")
-      .bind(recipients > 0 ? "queued" : "done", jobId)
-      .run();
-    return { jobId, recipients };
+    // D1 runs a batch as one transaction with no other writer in between,
+    // so the job just inserted is MAX(id).
+    const [job, recipients] = await this.db.batch([
+      this.db
+        .prepare(
+          `INSERT INTO jobs (kind, admin_phone, body, status, segments, encoding, created_at)
+           VALUES ('blast', ?, ?, 'queued', ?, ?, ?)`,
+        )
+        .bind(adminPhone, body, segments, encoding, nowIso),
+      this.db.prepare(
+        "INSERT INTO job_recipients (job_id, phone) SELECT (SELECT MAX(id) FROM jobs), phone FROM members WHERE status = 'active'",
+      ),
+      this.db.prepare(
+        `UPDATE jobs SET status = 'done', finished_at = created_at, summary_attempts = 0
+         WHERE id = (SELECT MAX(id) FROM jobs)
+           AND NOT EXISTS (SELECT 1 FROM job_recipients WHERE job_id = jobs.id)`,
+      ),
+    ]);
+    return { jobId: Number(job.meta.last_row_id), recipients: recipients.meta.changes ?? 0 };
   }
 
   /** Number of jobs ahead of this one (sending or queued earlier). */
@@ -128,6 +175,10 @@ export class Store {
 
   getSendingJob(): Promise<Job | null> {
     return this.db.prepare("SELECT * FROM jobs WHERE status = 'sending' ORDER BY id LIMIT 1").first<Job>();
+  }
+
+  getOldestQueuedJob(): Promise<Job | null> {
+    return this.db.prepare("SELECT * FROM jobs WHERE status = 'queued' ORDER BY id LIMIT 1").first<Job>();
   }
 
   async countQueued(): Promise<number> {
@@ -146,6 +197,10 @@ export class Store {
       )
       .bind(nowIso)
       .first<Job>();
+  }
+
+  async bumpJobCounter(jobId: number, column: "summary_attempts" | "finish_waits"): Promise<void> {
+    await this.db.prepare(`UPDATE jobs SET ${column} = ${column} + 1 WHERE id = ?`).bind(jobId).run();
   }
 
   async setCapNoticeDay(jobId: number, day: string): Promise<void> {
@@ -173,27 +228,42 @@ export class Store {
   }
 
   async jobCounts(jobId: number): Promise<JobCounts> {
-    const { results } = await this.db
-      .prepare("SELECT status, COUNT(*) AS n FROM job_recipients WHERE job_id = ? GROUP BY status")
+    const undelivered = UNDELIVERED.map((u) => `'${u}'`).join(",");
+    const r = await this.db
+      .prepare(
+        `SELECT COUNT(*) AS total,
+           SUM(status = 'sent' AND COALESCE(delivery, '') NOT IN (${undelivered})) AS sent,
+           SUM(status = 'failed' OR (status = 'sent' AND delivery IN (${undelivered}))) AS failed,
+           SUM(status = 'skipped') AS skipped,
+           SUM(status IN ('pending', 'sending')) AS pending,
+           SUM(status = 'sending') AS inFlight,
+           SUM(status = 'sent' AND delivery IS NULL) AS awaitingReceipt
+         FROM job_recipients WHERE job_id = ?`,
+      )
       .bind(jobId)
-      .all<{ status: string; n: number }>();
-    const c: JobCounts = { total: 0, sent: 0, failed: 0, skipped: 0, pending: 0 };
-    for (const r of results) {
-      c.total += r.n;
-      if (r.status === "sent") c.sent += r.n;
-      else if (r.status === "failed") c.failed += r.n;
-      else if (r.status === "skipped") c.skipped += r.n;
-      else c.pending += r.n; // pending or sending
-    }
-    return c;
+      .first<Record<keyof JobCounts, number | null>>();
+    const n = (k: keyof JobCounts) => Number(r?.[k] ?? 0);
+    return {
+      total: n("total"),
+      sent: n("sent"),
+      failed: n("failed"),
+      skipped: n("skipped"),
+      pending: n("pending"),
+      inFlight: n("inFlight"),
+      awaitingReceipt: n("awaitingReceipt"),
+    };
   }
 
   // ---- recipients ----
 
   /**
-   * Housekeeping before a batch: anyone no longer active is skipped, and any
-   * recipient stuck in 'sending' (a run that crashed mid-send) is marked failed
-   * rather than resent, so nobody ever gets the same blast twice.
+   * Housekeeping before a batch:
+   * - anyone no longer active is skipped;
+   * - if a run died mid-batch, its claimed recipients are still 'sending'. A run
+   *   texts them in phone order and saves each result right away, so the lowest
+   *   leftover number was the one in flight: it's marked failed rather than resent
+   *   (nobody ever gets the same blast twice). The rest were never tried and go
+   *   back to pending.
    */
   async tidyRecipients(jobId: number, staleBeforeIso: string): Promise<void> {
     await this.db.batch([
@@ -207,8 +277,13 @@ export class Store {
       this.db
         .prepare(
           `UPDATE job_recipients SET status = 'failed', error = 'interrupted; not resent'
-           WHERE job_id = ? AND status = 'sending' AND claimed_at < ?`,
+           WHERE job_id = ?1 AND status = 'sending' AND claimed_at < ?2
+             AND phone = (SELECT MIN(r2.phone) FROM job_recipients r2
+                          WHERE r2.job_id = ?1 AND r2.status = 'sending' AND r2.claimed_at = job_recipients.claimed_at)`,
         )
+        .bind(jobId, staleBeforeIso),
+      this.db
+        .prepare("UPDATE job_recipients SET status = 'pending', claimed_at = NULL WHERE job_id = ? AND status = 'sending' AND claimed_at < ?")
         .bind(jobId, staleBeforeIso),
     ]);
   }
@@ -229,42 +304,47 @@ export class Store {
     return results;
   }
 
-  async saveResults(jobId: number, results: RecipientResult[], nowIso: string): Promise<void> {
-    if (results.length === 0) return;
-    const stmts: D1PreparedStatement[] = [];
-    for (const r of results) {
-      if (r.outcome === "sent") {
-        stmts.push(
-          this.db
-            .prepare(
-              "UPDATE job_recipients SET status = 'sent', attempts = attempts + 1, telnyx_id = ?, error = NULL WHERE job_id = ? AND phone = ?",
-            )
-            .bind(r.telnyxId, jobId, r.phone),
-        );
-      } else if (r.outcome === "retry") {
-        stmts.push(
-          this.db
-            .prepare(
-              "UPDATE job_recipients SET status = 'pending', attempts = ?, next_attempt_at = ?, error = ? WHERE job_id = ? AND phone = ?",
-            )
-            .bind(r.attempts, r.nextAttemptAt, r.error, jobId, r.phone),
-        );
-      } else {
-        stmts.push(
-          this.db
-            .prepare("UPDATE job_recipients SET status = 'failed', attempts = ?, error = ? WHERE job_id = ? AND phone = ?")
-            .bind(r.attempts, r.error, jobId, r.phone),
-        );
-        if (r.optedOut) {
-          stmts.push(
-            this.db
-              .prepare("UPDATE members SET status = 'opted_out', updated_at = ? WHERE phone = ? AND status = 'active'")
-              .bind(nowIso, r.phone),
-          );
-        }
-      }
+  /**
+   * Saves one recipient's result right after his send, so a run that's cut off
+   * loses at most the one text in flight. Returns the job's status, so the
+   * sender notices a #cancel between texts.
+   */
+  async saveResult(jobId: number, r: RecipientResult, nowIso: string): Promise<string> {
+    const jobStatus = "(SELECT status FROM jobs WHERE id = job_recipients.job_id) AS job_status";
+    let stmt: D1PreparedStatement;
+    if (r.outcome === "sent") {
+      stmt = this.db
+        .prepare(
+          `UPDATE job_recipients SET status = 'sent', attempts = attempts + 1, telnyx_id = ?, error = NULL
+           WHERE job_id = ? AND phone = ? RETURNING ${jobStatus}`,
+        )
+        .bind(r.telnyxId, jobId, r.phone);
+    } else if (r.outcome === "retry") {
+      stmt = this.db
+        .prepare(
+          `UPDATE job_recipients SET status = 'pending', attempts = ?, next_attempt_at = ?, error = ?
+           WHERE job_id = ? AND phone = ? RETURNING ${jobStatus}`,
+        )
+        .bind(r.attempts, r.nextAttemptAt, r.error, jobId, r.phone);
+    } else {
+      stmt = this.db
+        .prepare(`UPDATE job_recipients SET status = 'failed', attempts = ?, error = ? WHERE job_id = ? AND phone = ? RETURNING ${jobStatus}`)
+        .bind(r.attempts, r.error, jobId, r.phone);
     }
-    await this.db.batch(stmts);
+    if (r.outcome === "failed" && r.optedOut) {
+      // Telnyx says he texted STOP: record it like an inbound STOP.
+      await this.optOut(r.phone, nowIso);
+    }
+    const row = await stmt.first<{ job_status: string }>();
+    return row?.job_status ?? "unknown";
+  }
+
+  /** After a #cancel mid-batch: the claimed texts this run didn't get to are skipped. */
+  async skipUnsentClaims(jobId: number): Promise<void> {
+    await this.db
+      .prepare("UPDATE job_recipients SET status = 'skipped', error = 'cancelled' WHERE job_id = ? AND status = 'sending'")
+      .bind(jobId)
+      .run();
   }
 
   async markWelcomedFromJob(jobId: number, nowIso: string): Promise<void> {
@@ -279,6 +359,12 @@ export class Store {
 
   async recordDelivery(telnyxId: string, status: string): Promise<void> {
     await this.db.prepare("UPDATE job_recipients SET delivery = ? WHERE telnyx_id = ?").bind(status, telnyxId).run();
+  }
+
+  /** True the first time this number asks for HELP today. */
+  async firstHelpToday(phone: string, day: string): Promise<boolean> {
+    const r = await this.db.prepare("INSERT OR IGNORE INTO help_replies (phone, day) VALUES (?, ?)").bind(phone, day).run();
+    return (r.meta.changes ?? 0) > 0;
   }
 
   // ---- daily cap ----
@@ -309,7 +395,15 @@ export class Store {
     return (r.meta.changes ?? 0) > 0;
   }
 
-  async releaseLock(name: string, token: string): Promise<void> {
-    await this.db.prepare("DELETE FROM locks WHERE name = ? AND token = ?").bind(name, token).run();
+  /**
+   * Releases the lock. `holdUntilMs` keeps it closed until then, which is how
+   * batches are spaced at least a minute apart.
+   */
+  async releaseLock(name: string, token: string, holdUntilMs?: number): Promise<void> {
+    if (holdUntilMs) {
+      await this.db.prepare("UPDATE locks SET until = ? WHERE name = ? AND token = ?").bind(holdUntilMs, name, token).run();
+    } else {
+      await this.db.prepare("DELETE FROM locks WHERE name = ? AND token = ?").bind(name, token).run();
+    }
   }
 }

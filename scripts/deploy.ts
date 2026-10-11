@@ -43,7 +43,7 @@ async function main() {
     id = created.out.match(/database_id"?\s*[:=]\s*"([0-9a-f-]{36})"/)?.[1];
     if (!id) {
       const list = wrangler(["d1", "list", "--json"], { quiet: true });
-      const parsed = JSON.parse(list.out.slice(list.out.indexOf("[")));
+      const parsed = JSON.parse(list.stdout.slice(list.stdout.indexOf("[")));
       id = parsed.find((d: any) => d.name === DB_NAME)?.uuid;
     }
     if (!id) die(`Couldn't create or find the ${DB_NAME} database.\n${created.out}`);

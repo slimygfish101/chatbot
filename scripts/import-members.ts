@@ -6,13 +6,13 @@
 //   add --local to use the local test database instead
 //
 // Nobody already opted out (STOP) is re-activated by an import.
-import { readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { welcomeText, type Config } from "../src/config";
-import { countSegments } from "../src/segments";
-import { die, ROOT, sql, tomlVar, wrangler } from "./lib";
-import { parseMemberList, toCsv } from "./members-parse";
+import { buildImportSql } from "./import-sql";
+import { die, ROOT, tomlVar, wrangler } from "./lib";
+import { maskLine, parseMemberList, toCsv } from "./members-parse";
 
 const args = process.argv.slice(2);
 const file = args.find((a) => !a.startsWith("--"));
@@ -25,7 +25,7 @@ writeFileSync(cleanPath, toCsv(rows));
 console.log(`\n${rows.length} members ready. Clean list saved to setup/members.clean.csv`);
 if (flags.length) {
   console.log(`\n${flags.length} line(s) need a look:`);
-  for (const f of flags) console.log(`  line ${f.line}: ${f.problem}\n      ${f.text.replace(/\d(?=\d{4})/g, "•")}`);
+  for (const f of flags) console.log(`  line ${f.line}: ${f.problem}\n      ${maskLine(f.text)}`);
 }
 
 if (!args.includes("--apply")) {
@@ -34,36 +34,21 @@ if (!args.includes("--apply")) {
 }
 
 const now = new Date().toISOString();
-const statements: string[] = rows.map(
-  (r) =>
-    `INSERT INTO members (phone, name, status, added_at, updated_at) VALUES (${sql(r.phone)}, ${sql(r.name)}, 'active', ${sql(now)}, ${sql(now)})
-     ON CONFLICT(phone) DO UPDATE SET
-       name = CASE WHEN excluded.name = '' THEN members.name ELSE excluded.name END,
-       status = CASE WHEN members.status = 'removed' THEN 'active' ELSE members.status END,
-       updated_at = excluded.updated_at;`,
-);
-
+let welcomeBody: string | undefined;
 if (args.includes("--welcome") && rows.length) {
   const cfg = { groupName: tomlVar("GROUP_NAME"), adminName: tomlVar("ADMIN_NAME") } as Config;
   if (!cfg.groupName || cfg.groupName.startsWith("REPLACE")) die("Set GROUP_NAME/ADMIN_NAME first (npm run deploy does it).");
-  const body = welcomeText(cfg);
-  const seg = countSegments(body);
-  const phones = rows.map((r) => sql(r.phone)).join(",");
-  statements.push(
-    `INSERT INTO jobs (kind, admin_phone, body, status, segments, encoding, created_at) VALUES ('welcome', NULL, ${sql(body)}, 'draft', ${seg.segments}, ${sql(seg.encoding)}, ${sql(now)});`,
-    `INSERT INTO job_recipients (job_id, phone) SELECT (SELECT MAX(id) FROM jobs WHERE kind = 'welcome' AND status = 'draft'), phone
-       FROM members WHERE status = 'active' AND welcomed_at IS NULL AND phone IN (${phones});`,
-    `UPDATE jobs SET status = CASE WHEN EXISTS (SELECT 1 FROM job_recipients WHERE job_id = jobs.id) THEN 'queued' ELSE 'done' END
-       WHERE kind = 'welcome' AND status = 'draft';`,
-  );
+  welcomeBody = welcomeText(cfg);
 }
+const statements = buildImportSql(rows, now, welcomeBody);
 
-// The SQL holds phone numbers, so it lives only briefly in the temp folder.
-const tmp = join(tmpdir(), `import-${process.pid}.sql`);
-writeFileSync(tmp, statements.join("\n"));
-try {
-  wrangler(["d1", "execute", "text-blast-db", args.includes("--local") ? "--local" : "--remote", "--file", tmp]);
-} finally {
-  rmSync(tmp, { force: true });
-}
+// The SQL holds phone numbers, so it lives only briefly in a private temp folder.
+const tmpDir = mkdtempSync(join(tmpdir(), "textblast-import-"));
+const tmp = join(tmpDir, "import.sql");
+writeFileSync(tmp, statements.join("\n"), { mode: 0o600 });
+const result = wrangler(["d1", "execute", "text-blast-db", args.includes("--local") ? "--local" : "--remote", "--file", tmp], {
+  allowFail: true,
+});
+rmSync(tmpDir, { recursive: true, force: true });
+if (!result.ok) die(`Import failed:\n${result.out}`);
 console.log(`\nSaved ${rows.length} members.${args.includes("--welcome") ? " Welcome texts are queued and go out about 15 a minute." : ""}`);

@@ -34,6 +34,14 @@ function fakeCtx() {
   };
 }
 
+/** One once-a-minute sender run, then a minute passes and carriers report delivery. */
+async function cron(s: ReturnType<typeof world>) {
+  const r = await runSender(s.cfg, s.deps);
+  s.db.sqlite.exec("UPDATE job_recipients SET delivery = 'delivered' WHERE status = 'sent' AND delivery IS NULL");
+  s.clock.advance(60_000);
+  return r;
+}
+
 function world() {
   const s = setup({ TELNYX_PUBLIC_KEY: "" });
   s.env.TELNYX_PUBLIC_KEY = publicKeyB64;
@@ -42,17 +50,19 @@ function world() {
 }
 
 describe("webhook replay", () => {
-  it("valid admin text → 200, blast created, first batch goes out right away", async () => {
+  it("valid admin text → 200, blast saved, sent by the next minute's runs", async () => {
     const s = world();
     const phones = addMembers(s.db, 20);
     const { ctx, settle } = fakeCtx();
     const res = await handleFetch(await signed(fixture("admin-blast.json"), s.clock.now().getTime() / 1000), s.env, ctx, s.deps);
     expect(res.status).toBe(200);
     await settle();
+    expect(s.db.rows("SELECT status FROM jobs")).toEqual([{ status: "queued" }]);
+    await cron(s);
     expect(s.telnyx.sent).toHaveLength(15);
     expect(s.telnyx.sent[0].text).toBe("Shiur is moved to 8pm tonight.");
-    s.clock.advance(60_000);
-    await runSender(s.cfg, s.deps);
+    await cron(s);
+    await cron(s);
     for (const p of phones) expect(s.telnyx.to(p)).toHaveLength(1);
     expect(s.telnyx.to(ADMIN).at(-1)!.text).toBe("Sent to 20 of 20.");
   });
@@ -66,7 +76,10 @@ describe("webhook replay", () => {
       expect((await handleFetch(await signed(body, s.clock.now().getTime() / 1000), s.env, ctx, s.deps)).status).toBe(200);
       await settle();
     }
+    await cron(s);
+    await cron(s);
     for (const p of phones) expect(s.telnyx.to(p)).toHaveLength(1);
+    expect(s.db.rows("SELECT * FROM jobs")).toHaveLength(1);
   });
 
   it("long MMS from the admin goes out as text-only SMS", async () => {
@@ -75,6 +88,8 @@ describe("webhook replay", () => {
     const { ctx, settle } = fakeCtx();
     await handleFetch(await signed(fixture("admin-long-mms.json"), s.clock.now().getTime() / 1000), s.env, ctx, s.deps);
     await settle();
+    await cron(s);
+    await cron(s);
     const sent = s.telnyx.to(p);
     expect(sent).toHaveLength(1);
     expect(sent[0].type).toBe("SMS");
@@ -98,6 +113,7 @@ describe("webhook replay", () => {
     const { ctx, settle } = fakeCtx();
     await handleFetch(await signed(fixture("admin-blast.json"), s.clock.now().getTime() / 1000), s.env, ctx, s.deps);
     await settle();
+    await runSender(s.cfg, s.deps); // sends to …1000 as msg-1
     const c2 = fakeCtx();
     await handleFetch(await signed(fixture("message-finalized.json"), s.clock.now().getTime() / 1000), s.env, c2.ctx, s.deps);
     await c2.settle();

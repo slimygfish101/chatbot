@@ -3,12 +3,21 @@ import { handleInbound } from "../src/inbound";
 import { runSender } from "../src/sender";
 import { ADMIN, addMembers, inbound, setup } from "./helpers";
 
-/** Runs the once-a-minute sender until the current blast finishes (or max runs). */
-async function drain(s: ReturnType<typeof setup>, maxRuns = 50) {
+/** Carriers report every sent text as delivered. */
+function receipts(s: ReturnType<typeof setup>, status = "delivered") {
+  s.db.sqlite.prepare("UPDATE job_recipients SET delivery = ? WHERE status = 'sent' AND delivery IS NULL").run(status);
+}
+
+/**
+ * Runs the once-a-minute sender until the current blast finishes (or max runs).
+ * Delivery reports arrive between runs unless `withReceipts` is false.
+ */
+async function drain(s: ReturnType<typeof setup>, maxRuns = 50, withReceipts = true) {
   let runs = 0;
   for (; runs < maxRuns; runs++) {
     const r = await runSender(s.cfg, s.deps);
     if (r === "done" || r === "idle") break;
+    if (withReceipts) receipts(s);
     s.clock.advance(60_000);
   }
   return runs + 1;
@@ -22,7 +31,7 @@ describe("blast from admin", () => {
     expect(await handleInbound(s.cfg, s.deps, inbound(ADMIN, "Bus leaves at 7:30 tomorrow."))).toBe("blast_created");
 
     const runs = await drain(s);
-    expect(runs).toBe(7); // ceil(100 / 15)
+    expect(runs).toBe(8); // ceil(100 / 15) batches, then the summary once delivery reports are in
     for (const p of phones) expect(s.telnyx.to(p)).toHaveLength(1);
     expect(s.telnyx.sent.every((m) => m.type === "SMS" && m.from === "+12125550000")).toBe(true);
     expect(s.telnyx.to(phones[0])[0].text).toBe("Bus leaves at 7:30 tomorrow.");
@@ -40,7 +49,7 @@ describe("blast from admin", () => {
   it("only sends to active members", async () => {
     const s = setup();
     const active = addMembers(s.db, 3);
-    s.db.sqlite.exec(`INSERT INTO members VALUES ('+13475559998','Out','opted_out','x','x',NULL), ('+13475559999','Gone','removed','x','x',NULL)`);
+    s.db.sqlite.exec(`INSERT INTO members (phone,name,status,added_at,updated_at,welcomed_at) VALUES ('+13475559998','Out','opted_out','x','x',NULL), ('+13475559999','Gone','removed','x','x',NULL)`);
     await handleInbound(s.cfg, s.deps, inbound(ADMIN, "hi"));
     await drain(s);
     expect(s.telnyx.sent.filter((m) => m.to !== ADMIN).map((m) => m.to).sort()).toEqual(active);
@@ -63,7 +72,7 @@ describe("blast from admin", () => {
     addMembers(s.db, 2);
     await handleInbound(s.cfg, s.deps, inbound(ADMIN, "Mazel tov! 🎉 " + "x".repeat(70)));
     await drain(s);
-    expect(s.telnyx.to(ADMIN).at(-1)!.text).toBe("Sent to 2 of 2. Long or special characters: used 2 texts per person.");
+    expect(s.telnyx.to(ADMIN).at(-1)!.text).toBe("Sent to 2 of 2. Special characters: used 2 texts per person.");
   });
 
   it("uses only the text of an MMS and never forwards media", async () => {
@@ -143,7 +152,7 @@ describe("queueing and cancel", () => {
     await handleInbound(s.cfg, s.deps, inbound(ADMIN, "oops"));
     await runSender(s.cfg, s.deps);
     await handleInbound(s.cfg, s.deps, inbound(ADMIN, "#cancel"));
-    expect(s.telnyx.to(ADMIN).at(-1)!.text).toBe("Cancelled. 15 of 40 had already been sent.");
+    expect(s.telnyx.to(ADMIN).at(-1)!.text).toBe('Cancelled "oops". 15 of 40 had already been sent.');
     s.clock.advance(60_000);
     expect(await runSender(s.cfg, s.deps)).toBe("idle");
     expect(s.telnyx.sent.filter((m) => phones.includes(m.to))).toHaveLength(15);
@@ -183,11 +192,16 @@ describe("retries and failures", () => {
     let failures = 0;
     s.telnyx.respond = (to) => (to === p && failures++ < 2 ? { status: failures === 1 ? 429 : 503, body: {} } : null);
     await handleInbound(s.cfg, s.deps, inbound(ADMIN, "hi"));
-    expect(await runSender(s.cfg, s.deps)).toBe("sent_batch"); // 429
-    s.clock.advance(10_000);
-    expect(await runSender(s.cfg, s.deps)).toBe("waiting"); // backoff not over
-    s.clock.advance(25_000);
-    await runSender(s.cfg, s.deps); // 503
+    expect(await runSender(s.cfg, s.deps)).toBe("sent_batch"); // 429, retry in 30s
+    s.clock.advance(60_000);
+    expect(await runSender(s.cfg, s.deps)).toBe("sent_batch"); // 503, retry in 60s
+    s.clock.advance(30_000);
+    expect(await runSender(s.cfg, s.deps)).toBe("locked"); // batches stay at least 55s apart
+    s.clock.advance(26_000);
+    expect(await runSender(s.cfg, s.deps)).toBe("waiting"); // 56s after the 503: backoff (60s) not over
+    s.clock.advance(60_000);
+    expect(await runSender(s.cfg, s.deps)).toBe("waiting_receipts"); // sent; waiting for the carrier's report
+    receipts(s);
     s.clock.advance(60_000);
     expect(await runSender(s.cfg, s.deps)).toBe("done");
     expect(s.telnyx.to(p)).toHaveLength(1);
@@ -222,16 +236,27 @@ describe("retries and failures", () => {
     expect(s.db.rows("SELECT status FROM members")[0].status).toBe("opted_out");
   });
 
-  it("someone stuck mid-send after a crash is marked failed, not resent", async () => {
+  it("after a crash mid-batch, the text in flight isn't resent and the untried ones still go out", async () => {
     const s = setup();
-    const [p] = addMembers(s.db, 1);
+    const phones = addMembers(s.db, 5);
     await handleInbound(s.cfg, s.deps, inbound(ADMIN, "hi"));
-    await s.deps.store.startNextQueued(s.clock.now().toISOString());
-    await s.deps.store.claimDue(1, 15, s.clock.now().toISOString()); // simulate a crash right after claiming
-    s.clock.advance(6 * 60_000);
+    // A run claims all 5, texts the first 2, then dies while texting the 3rd.
+    let saves = 0;
+    const realSave = s.deps.store.saveResult.bind(s.deps.store);
+    s.deps.store.saveResult = async (...a) => {
+      if (++saves === 3) throw new Error("Worker killed");
+      return realSave(...a);
+    };
+    await expect(runSender(s.cfg, s.deps)).rejects.toThrow("Worker killed");
+    s.deps.store.saveResult = realSave;
+    expect(s.telnyx.sent.map((m) => m.to)).toEqual(phones.slice(0, 3));
+
+    s.clock.advance(11 * 60_000); // past the stale-claim time
     await drain(s);
-    expect(s.telnyx.to(p)).toHaveLength(0);
-    expect(s.telnyx.to(ADMIN).at(-1)!.text).toBe("Sent to 0 of 1. 1 failed.");
+    for (const p of phones.slice(0, 2)) expect(s.telnyx.to(p)).toHaveLength(1);
+    expect(s.telnyx.to(phones[2])).toHaveLength(1); // sent once (before the crash), never again
+    for (const p of phones.slice(3)) expect(s.telnyx.to(p)).toHaveLength(1);
+    expect(s.telnyx.to(ADMIN).at(-1)!.text).toBe("Sent to 4 of 5. 1 failed.");
   });
 });
 
@@ -273,13 +298,13 @@ describe("admin commands", () => {
     const s = setup();
     await handleInbound(s.cfg, s.deps, inbound(ADMIN, "#add 718 555 1234 Moshe"));
     expect(s.telnyx.to("+17185551234")[0].text).toContain("You're on the announcement list from Rabbi Cohen");
-    expect(s.telnyx.to(ADMIN)[0].text).toBe("Added Moshe (…1234). Welcome text sent. 1 active.");
+    expect(s.telnyx.to(ADMIN)[0].text).toBe("Added Moshe (ending 1234). Welcome text sent. 1 active.");
     expect(s.db.rows("SELECT name, status, welcomed_at IS NOT NULL AS w FROM members")).toEqual([{ name: "Moshe", status: "active", w: 1 }]);
   });
 
   it("#add re-activates a removed member", async () => {
     const s = setup();
-    s.db.sqlite.exec(`INSERT INTO members VALUES ('+17185551234','Moshe','removed','x','x',NULL)`);
+    s.db.sqlite.exec(`INSERT INTO members (phone,name,status,added_at,updated_at,welcomed_at) VALUES ('+17185551234','Moshe','removed','x','x',NULL)`);
     await handleInbound(s.cfg, s.deps, inbound(ADMIN, "#add 7185551234"));
     expect(s.db.rows("SELECT status FROM members")[0].status).toBe("active");
     expect(s.telnyx.to(ADMIN)[0].text).toContain("Added Moshe");
@@ -287,7 +312,7 @@ describe("admin commands", () => {
 
   it("#add will not override someone's own STOP", async () => {
     const s = setup();
-    s.db.sqlite.exec(`INSERT INTO members VALUES ('+17185551234','Moshe','opted_out','x','x',NULL)`);
+    s.db.sqlite.exec(`INSERT INTO members (phone,name,status,added_at,updated_at,welcomed_at) VALUES ('+17185551234','Moshe','opted_out','x','x',NULL)`);
     await handleInbound(s.cfg, s.deps, inbound(ADMIN, "#add 7185551234 Moshe"));
     expect(s.db.rows("SELECT status FROM members")[0].status).toBe("opted_out");
     expect(s.telnyx.to("+17185551234")).toHaveLength(0);
@@ -296,10 +321,10 @@ describe("admin commands", () => {
 
   it("#add on someone already active doesn't re-send the welcome", async () => {
     const s = setup();
-    s.db.sqlite.exec(`INSERT INTO members VALUES ('+17185551234','Moshe','active','x','x','x')`);
+    s.db.sqlite.exec(`INSERT INTO members (phone,name,status,added_at,updated_at,welcomed_at) VALUES ('+17185551234','Moshe','active','x','x','x')`);
     await handleInbound(s.cfg, s.deps, inbound(ADMIN, "#add 7185551234"));
     expect(s.telnyx.to("+17185551234")).toHaveLength(0);
-    expect(s.telnyx.to(ADMIN)[0].text).toBe("Already on the list: Moshe (…1234).");
+    expect(s.telnyx.to(ADMIN)[0].text).toBe("Already on the list: Moshe (ending 1234).");
   });
 
   it("#remove, #count, #help, unknown", async () => {
@@ -310,7 +335,7 @@ describe("admin commands", () => {
     await handleInbound(s.cfg, s.deps, inbound(ADMIN, "#help"));
     await handleInbound(s.cfg, s.deps, inbound(ADMIN, "#blast hi all"));
     expect(s.telnyx.to(ADMIN).map((m) => m.text)).toEqual([
-      "Removed Boy 0 (…1000). 2 active.",
+      "Removed Boy 0 (ending 1000). 2 active.",
       "2 active members. 0 opted out.",
       expect.stringContaining("#add 2125551234 Name"),
       'Unknown command "#blast". Not sent. Text #help for the list.',
@@ -341,7 +366,7 @@ describe("member keywords", () => {
 
   it("START from a stranger or a removed member doesn't add them", async () => {
     const s = setup();
-    s.db.sqlite.exec(`INSERT INTO members VALUES ('+17185551234','Moshe','removed','x','x',NULL)`);
+    s.db.sqlite.exec(`INSERT INTO members (phone,name,status,added_at,updated_at,welcomed_at) VALUES ('+17185551234','Moshe','removed','x','x',NULL)`);
     await handleInbound(s.cfg, s.deps, inbound("+17185551234", "START"));
     await handleInbound(s.cfg, s.deps, inbound("+17185559999", "UNSTOP"));
     expect(s.db.rows("SELECT phone, status FROM members")).toEqual([{ phone: "+17185551234", status: "removed" }]);

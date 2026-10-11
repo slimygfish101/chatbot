@@ -41,12 +41,11 @@ export async function handleFetch(req: Request, env: Env, ctx: ExecutionContext,
 
   if (type === "message.received" && payload) {
     // Answer Telnyx right away; do the work in the background.
+    // Blasts start on the next once-a-minute sender run (within 60 seconds).
     ctx.waitUntil(
-      (async () => {
-        const outcome = await handleInbound(cfg, deps, payload as InboundPayload);
-        log("inbound_handled", { outcome });
-        if (outcome === "blast_created") log("sender_run", { result: await runSender(cfg, deps) });
-      })().catch((e) => log("inbound_error", { error: String(e?.message ?? e) })),
+      handleInbound(cfg, deps, payload as InboundPayload)
+        .then((outcome) => log("inbound_handled", { outcome }))
+        .catch((e) => log("inbound_error", { error: String(e?.message ?? e) })),
     );
   } else if (type === "message.finalized" && payload?.id) {
     // Delivery report for something we sent. Saved for troubleshooting.

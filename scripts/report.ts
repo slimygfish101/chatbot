@@ -1,11 +1,11 @@
 // Shows the most recent blast and who it went (or would have gone) to.
 //   npm run report            (add --local for the local test database)
-import { wrangler } from "./lib";
+import { d1Rows, wrangler } from "./lib";
 
 const where = process.argv.includes("--local") ? "--local" : "--remote";
 const q = (sqlText: string): any[] => {
   const r = wrangler(["d1", "execute", "text-blast-db", where, "--json", "--command", sqlText], { quiet: true });
-  return JSON.parse(r.out.slice(r.out.indexOf("[")))[0]?.results ?? [];
+  return d1Rows(r);
 };
 
 const [job] = q("SELECT id, kind, status, body, segments, created_at, finished_at FROM jobs WHERE status != 'draft' ORDER BY id DESC LIMIT 1");

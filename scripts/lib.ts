@@ -61,7 +61,10 @@ export function die(msg: string): never {
 }
 
 /** Runs wrangler. Returns stdout; exits on failure unless allowFail. */
-export function wrangler(args: string[], opts: { input?: string; allowFail?: boolean; quiet?: boolean } = {}): { ok: boolean; out: string } {
+export function wrangler(
+  args: string[],
+  opts: { input?: string; allowFail?: boolean; quiet?: boolean } = {},
+): { ok: boolean; out: string; stdout: string } {
   const r = spawnSync("npx", ["--no-install", "wrangler", ...args], {
     cwd: ROOT,
     input: opts.input,
@@ -75,7 +78,14 @@ export function wrangler(args: string[], opts: { input?: string; allowFail?: boo
     process.stderr.write(r.stderr ?? "");
     die(`wrangler ${args[0]} failed`);
   }
-  return { ok: r.status === 0, out };
+  return { ok: r.status === 0, out, stdout: r.stdout ?? "" };
+}
+
+/** Rows from `wrangler d1 execute --json` (parses stdout only; warnings go to stderr). */
+export function d1Rows(r: { stdout: string }): any[] {
+  const start = r.stdout.indexOf("[");
+  if (start < 0) die(`Unexpected wrangler output:\n${r.stdout.slice(0, 500)}`);
+  return JSON.parse(r.stdout.slice(start))[0]?.results ?? [];
 }
 
 /** Reads a [vars] value from wrangler.toml. */
@@ -92,6 +102,3 @@ export function setTomlValue(name: string, value: string): void {
   if (!re.test(toml)) die(`${name} not found in wrangler.toml`);
   writeFileSync(file, toml.replace(re, `$1${JSON.stringify(value)}`));
 }
-
-/** SQL string literal. */
-export const sql = (v: string | null | undefined) => (v == null ? "NULL" : `'${String(v).replace(/'/g, "''")}'`);

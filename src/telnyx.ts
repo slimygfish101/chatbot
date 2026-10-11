@@ -22,6 +22,8 @@ export async function sendSms(cfg: Config, fetchFn: FetchFn, to: string, text: s
       method: "POST",
       headers: { Authorization: `Bearer ${cfg.apiKey}`, "Content-Type": "application/json" },
       body: JSON.stringify({ from: cfg.number, to, text, type: "SMS" }),
+      // A hung request becomes a retryable error instead of stalling the whole batch.
+      signal: AbortSignal.timeout(10_000),
     });
   } catch (e) {
     return { ok: false, retryable: true, optedOut: false, error: `network: ${(e as Error).message}` };

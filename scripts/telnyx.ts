@@ -19,7 +19,7 @@
 // Needs TELNYX_API_KEY in the environment. Never put it in a file.
 import { die, loadAnswers, loadState, saveState } from "./lib";
 import { campaignBody } from "./campaign";
-import { toE164 } from "../src/phone";
+import { mask, toE164 } from "../src/phone";
 
 const API = "https://api.telnyx.com/v2";
 const key = process.env.TELNYX_API_KEY;
@@ -154,7 +154,7 @@ async function main() {
         country: "US",
         vertical: "EDUCATION",
       };
-      console.log(JSON.stringify({ ...body, email: "(hidden)", street: "(hidden)" }, null, 2));
+      console.log(JSON.stringify({ ...body, phone: mask(mobile), mobilePhone: mask(mobile), email: "(hidden)", street: "(hidden)" }, null, 2));
       needYes("This submits the Sole Proprietor brand registration (one-time fee).");
       const brand = await must("POST", "/10dlc/brand", body);
       const brandId = brand.brandId ?? brand.data?.brandId ?? brand.id;

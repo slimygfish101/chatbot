@@ -1,11 +1,11 @@
 import { type Config, helpReplyText, welcomeText } from "./config";
 import { HELP_TEXT, isCommand, parseCommand } from "./commands";
-import { classifyKeyword } from "./keywords";
+import { classifyKeyword, type Keyword } from "./keywords";
 import { log } from "./log";
-import { mask, toE164 } from "./phone";
+import { mask, smsMask, toE164 } from "./phone";
 import { countSegments } from "./segments";
-import type { Store } from "./store";
-import type { FetchFn } from "./telnyx";
+import type { Job, Store } from "./store";
+import type { FetchFn, SendResult } from "./telnyx";
 import { dayKey, sendAndCount } from "./sender";
 
 export interface Deps {
@@ -30,6 +30,7 @@ export type InboundOutcome =
   | "ignored_wrong_number"
   | "ignored_bad_payload"
   | "duplicate"
+  | "failed"
   | "blast_created"
   | "blast_empty"
   | "admin_command"
@@ -60,18 +61,48 @@ export async function handleInbound(cfg: Config, deps: Deps, p: InboundPayload):
   // Only the text part. Pictures/attachments (MMS media) are never forwarded.
   const text = (p.text ?? "").trim();
   const hadMedia = Array.isArray(p.media) && p.media.length > 0;
+  const isAdmin = cfg.admins.includes(from);
 
-  if (cfg.admins.includes(from)) return handleAdmin(cfg, deps, from, text, hadMedia);
-  return handleMember(cfg, deps, from, text, p.autoresponse_type);
+  const progress = { blastSaved: false };
+  try {
+    if (isAdmin) return await handleAdmin(cfg, deps, from, text, hadMedia, progress);
+    return await handleMember(cfg, deps, from, text, p.autoresponse_type);
+  } catch (e) {
+    log("inbound_error", { id, from: mask(from), blastSaved: progress.blastSaved, error: String((e as Error)?.message ?? e) });
+    // If the blast was saved it will still go out; asking for a resend would send it twice.
+    if (progress.blastSaved) return "blast_created";
+    // Otherwise forget this message id so a resend works, and tell the admin.
+    await deps.store.forgetProcessed(id).catch(() => undefined);
+    if (isAdmin) await reply(cfg, deps, from, "Not sent because of a system error. Please send it again.").catch(() => false);
+    return "failed";
+  }
 }
 
-/** Sends one text and returns whether Telnyx accepted it. */
+/** Sends one text and returns Telnyx's result. */
+async function send(cfg: Config, deps: Deps, to: string, text: string): Promise<SendResult> {
+  return sendAndCount(cfg, deps, to, text, dayKey(deps.now(), cfg.timezone));
+}
+
 async function reply(cfg: Config, deps: Deps, to: string, text: string): Promise<boolean> {
-  const r = await sendAndCount(cfg, deps, to, text, dayKey(deps.now(), cfg.timezone));
-  return r.ok;
+  return (await send(cfg, deps, to, text)).ok;
 }
 
-async function handleAdmin(cfg: Config, deps: Deps, admin: string, text: string, hadMedia: boolean): Promise<InboundOutcome> {
+/** Applies a member STOP/START from any number (admins too, if they're on the list). */
+async function applyKeywordStatus(deps: Deps, from: string, kw: Keyword, nowIso: string): Promise<void> {
+  if (kw === "opt_out") await deps.store.optOut(from, nowIso);
+  if (kw === "opt_in") await deps.store.optIn(from, nowIso);
+}
+
+const preview = (body: string) => (body.length > 25 ? `${body.slice(0, 25).trimEnd()}...` : body);
+
+async function handleAdmin(
+  cfg: Config,
+  deps: Deps,
+  admin: string,
+  text: string,
+  hadMedia: boolean,
+  progress: { blastSaved: boolean },
+): Promise<InboundOutcome> {
   const { store } = deps;
   const nowIso = deps.now().toISOString();
 
@@ -84,6 +115,7 @@ async function handleAdmin(cfg: Config, deps: Deps, admin: string, text: string,
   const kw = classifyKeyword(text);
   if (kw) {
     log("admin_keyword_not_sent", { admin: mask(admin), kw });
+    await applyKeywordStatus(deps, admin, kw, nowIso);
     // After STOP the carrier blocks texts to the admin, so there's no point replying.
     if (kw !== "opt_out") await reply(cfg, deps, admin, `Not sent: "${text.toUpperCase()}" is a reserved word. Text #help for commands.`);
     return "admin_rejected";
@@ -106,7 +138,7 @@ async function handleAdmin(cfg: Config, deps: Deps, admin: string, text: string,
       }
       case "add": {
         const existing = await store.getMember(cmd.phone);
-        const label = (name: string) => `${name || "Member"} (${mask(cmd.phone)})`;
+        const label = (name: string) => `${name || "Member"} (${smsMask(cmd.phone)})`;
         if (existing?.status === "opted_out") {
           await reply(cfg, deps, admin, `Not added: ${label(existing.name)} texted STOP. He has to text START to this number himself.`);
         } else if (existing?.status === "active") {
@@ -114,31 +146,34 @@ async function handleAdmin(cfg: Config, deps: Deps, admin: string, text: string,
           await reply(cfg, deps, admin, `Already on the list: ${label(cmd.name || existing.name)}.`);
         } else {
           await store.upsertActive(cmd.phone, cmd.name, nowIso);
-          const sent = await reply(cfg, deps, cmd.phone, welcomeText(cfg));
-          if (sent) await store.markWelcomed(cmd.phone, nowIso);
+          const name = cmd.name || existing?.name || "";
+          const welcome = await send(cfg, deps, cmd.phone, welcomeText(cfg));
+          if (!welcome.ok && welcome.optedOut) {
+            // He had texted STOP to this number before; the carrier blocks us.
+            await store.optOut(cmd.phone, nowIso);
+            await reply(cfg, deps, admin, `Not added: ${label(name)} had texted STOP. He has to text START to this number himself.`);
+            break;
+          }
+          if (welcome.ok && !cfg.dryRun) await store.markWelcomed(cmd.phone, nowIso);
           const c = await store.countByStatus();
-          await reply(
-            cfg,
-            deps,
-            admin,
-            `Added ${label(cmd.name || existing?.name || "")}. ${sent ? "Welcome text sent." : "Welcome text FAILED."} ${c.active} active.`,
-          );
+          await reply(cfg, deps, admin, `Added ${label(name)}. ${welcome.ok ? "Welcome text sent." : "Welcome text FAILED."} ${c.active} active.`);
         }
         break;
       }
       case "remove": {
         const existing = await store.getMember(cmd.phone);
         if (!existing) {
-          await reply(cfg, deps, admin, `No member with number ${mask(cmd.phone)}.`);
+          await reply(cfg, deps, admin, `No member with number ${smsMask(cmd.phone)}.`);
         } else {
           if (existing.status === "active") await store.setStatus(cmd.phone, "removed", nowIso);
           const c = await store.countByStatus();
-          await reply(cfg, deps, admin, `Removed ${existing.name || "member"} (${mask(cmd.phone)}). ${c.active} active.`);
+          await reply(cfg, deps, admin, `Removed ${existing.name || "member"} (${smsMask(cmd.phone)}). ${c.active} active.`);
         }
         break;
       }
       case "cancel": {
-        const job = await store.getSendingJob();
+        // The one that's going out now; if none, the next one waiting.
+        const job: Job | null = (await store.getSendingJob()) ?? (await store.getOldestQueuedJob());
         if (!job) {
           await reply(cfg, deps, admin, "Nothing is sending right now.");
           break;
@@ -146,12 +181,10 @@ async function handleAdmin(cfg: Config, deps: Deps, admin: string, text: string,
         await store.cancelJob(job.id, nowIso);
         const c = await store.jobCounts(job.id);
         const queued = await store.countQueued();
-        await reply(
-          cfg,
-          deps,
-          admin,
-          `Cancelled. ${c.sent} of ${c.total} had already been sent.${queued ? ` ${queued} queued message(s) will go out next.` : ""}`,
-        );
+        const parts = [`Cancelled "${preview(job.body)}". ${c.sent} of ${c.total} had already been sent.`];
+        if (c.inFlight) parts.push(`Up to ${c.inFlight} more were already on their way.`);
+        if (queued) parts.push(`${queued} waiting message(s) will go out next.`);
+        await reply(cfg, deps, admin, parts.join(" "));
         break;
       }
     }
@@ -161,6 +194,7 @@ async function handleAdmin(cfg: Config, deps: Deps, admin: string, text: string,
   // Anything else is a blast.
   const seg = countSegments(text);
   const { jobId, recipients } = await store.createBlastJob(admin, text, seg.segments, seg.encoding, nowIso);
+  progress.blastSaved = recipients > 0;
   log("blast_created", { job: jobId, recipients, segments: seg.segments, encoding: seg.encoding, dryRun: cfg.dryRun });
   if (recipients === 0) {
     await reply(cfg, deps, admin, "Not sent: there are no active members on the list.");
@@ -183,26 +217,31 @@ async function handleMember(
   autoresponseType: string | null | undefined,
 ): Promise<InboundOutcome> {
   const { store } = deps;
-  const nowIso = deps.now().toISOString();
+  const now = deps.now();
+  const nowIso = now.toISOString();
   const kw = classifyKeyword(text);
 
   if (kw === "opt_out") {
     // Telnyx/the carrier sends the opt-out confirmation; we only update the list.
-    const changed = await store.setStatus(from, "opted_out", nowIso, "active");
-    log("member_opt_out", { from: mask(from), changed });
+    // Recorded even for numbers not on the list, so a later #add or import can't text them.
+    await applyKeywordStatus(deps, from, kw, nowIso);
+    log("member_opt_out", { from: mask(from) });
     return "member_opt_out";
   }
   if (kw === "opt_in") {
-    // Only people who were on the list and opted out themselves come back.
-    // Someone the admin removed stays removed.
-    const changed = await store.setStatus(from, "active", nowIso, "opted_out");
-    log("member_opt_in", { from: mask(from), changed });
+    // Puts him back where he was before STOP. Nobody joins the list this way.
+    await applyKeywordStatus(deps, from, kw, nowIso);
+    log("member_opt_in", { from: mask(from) });
     return "member_opt_in";
   }
   if (kw === "help") {
+    const day = dayKey(now, cfg.timezone);
     const telnyxAnswered = cfg.telnyxRepliesToHelp || Boolean(autoresponseType);
-    if (!telnyxAnswered) await reply(cfg, deps, from, helpReplyText(cfg));
-    log("member_help", { from: mask(from), replied: !telnyxAnswered });
+    // One reply per number per day, and never past the daily cap, so HELP can't be used to run up texts.
+    const shouldReply =
+      !telnyxAnswered && (await store.getDailyCount(day)) < cfg.maxTextsPerDay && (await store.firstHelpToday(from, day));
+    if (shouldReply) await reply(cfg, deps, from, helpReplyText(cfg));
+    log("member_help", { from: mask(from), replied: shouldReply });
     return "member_help";
   }
   log("ignored_member_text", { from: mask(from) });

@@ -2,12 +2,21 @@ import type { Config } from "./config";
 import type { Deps } from "./inbound";
 import { log } from "./log";
 import { mask } from "./phone";
-import type { Job, RecipientResult } from "./store";
+import { countSegments } from "./segments";
+import type { Job, JobCounts, RecipientResult } from "./store";
 import { type SendResult, sendSms } from "./telnyx";
 
 export const MAX_ATTEMPTS = 4;
-const LOCK_TTL_MS = 55_000;
-const STALE_CLAIM_MS = 5 * 60_000;
+/** Longest a sender run may hold the lock before another run may take over. */
+const LOCK_TTL_MS = 5 * 60_000;
+/** Minimum time between the starts of two batches (carrier limit is ~15 texts/minute). */
+export const BATCH_GAP_MS = 55_000;
+/** A recipient stuck mid-send longer than this belongs to a run that died. Must exceed LOCK_TTL_MS. */
+const STALE_CLAIM_MS = 10 * 60_000;
+/** How many minutes to wait for carrier delivery reports before sending the summary. */
+const RECEIPT_WAITS = 2;
+/** Summary send attempts before giving up on it. */
+const SUMMARY_ATTEMPTS = 3;
 
 /** Calendar day (YYYY-MM-DD) in the configured time zone, for the daily cap. */
 export function dayKey(now: Date, timezone: string): string {
@@ -19,26 +28,33 @@ export function backoffMs(attempt: number): number {
   return 30_000 * 2 ** (attempt - 1);
 }
 
-/** How many recipients to send to this run, given the cap and texts-per-person. */
+/**
+ * How many people to text this run. `batchSize` and `capLeft` are in texts
+ * (segments); a 2-segment message reaches half as many people per run.
+ */
 export function batchLimit(batchSize: number, segments: number, capLeft: number): number {
-  const perRun = Math.max(1, Math.floor(batchSize / Math.max(1, segments)));
-  return Math.max(0, Math.min(perRun, capLeft));
+  const seg = Math.max(1, segments);
+  const perRun = Math.max(1, Math.floor(batchSize / seg));
+  return Math.max(0, Math.min(perRun, Math.floor(capLeft / seg)));
 }
 
 /** Sends one text (admin reply, welcome, etc.) and counts it toward the daily total. */
 export async function sendAndCount(cfg: Config, deps: Deps, to: string, text: string, day: string): Promise<SendResult> {
   const r = await sendSms(cfg, deps.fetch, to, text);
-  if (r.ok) await deps.store.addDailyCount(day, 1);
-  else log("send_failed", { to: mask(to), error: r.error });
+  if (r.ok && !cfg.dryRun) await deps.store.addDailyCount(day, countSegments(text).segments);
+  if (!r.ok) log("send_failed", { to: mask(to), error: r.error });
   return r;
 }
 
-export function summaryText(job: Job, c: { total: number; sent: number; failed: number; skipped: number }, dryRun: boolean): string {
+export function summaryText(job: Job, c: JobCounts, dryRun: boolean): string {
   const what = job.kind === "welcome" ? "Welcome texts: sent" : "Sent";
   const parts = [`${dryRun ? "DRY RUN (nothing really sent): " : ""}${what} to ${c.sent} of ${c.total}.`];
   if (c.failed) parts.push(`${c.failed} failed.`);
   if (c.skipped) parts.push(`${c.skipped} skipped (opted out or removed).`);
-  if (job.segments > 1) parts.push(`Long or special characters: used ${job.segments} texts per person.`);
+  if (job.segments > 1 || job.encoding !== "GSM-7") {
+    const why = job.encoding !== "GSM-7" ? "Special characters" : "Long message";
+    parts.push(`${why}: used ${job.segments} text${job.segments > 1 ? "s" : ""} per person.`);
+  }
   return parts.join(" ");
 }
 
@@ -46,17 +62,28 @@ function adminFor(cfg: Config, job: Job): string | null {
   return job.admin_phone ?? cfg.admins[0] ?? null;
 }
 
+function toResult(phone: string, attempts: number, res: SendResult, now: Date): RecipientResult {
+  if (res.ok) return { phone, outcome: "sent", telnyxId: res.id };
+  if (res.retryable && attempts < MAX_ATTEMPTS) {
+    return { phone, outcome: "retry", attempts, nextAttemptAt: new Date(now.getTime() + backoffMs(attempts)).toISOString(), error: res.error };
+  }
+  return { phone, outcome: "failed", attempts, error: res.error, optedOut: res.optedOut };
+}
+
 /**
- * Sends the next batch of the current blast. Runs every minute from the cron
- * trigger, and right after a new blast arrives. Safe to run twice at once:
- * a lock makes the second run do nothing.
+ * Sends the next batch of the current blast. Runs once a minute from the cron
+ * trigger. A lock stops two runs from overlapping, and after a run that sent
+ * texts the lock stays closed for BATCH_GAP_MS, which paces the batches.
  */
 export async function runSender(cfg: Config, deps: Deps): Promise<string> {
   if (cfg.paused) return "paused";
   const { store } = deps;
   const lockToken = crypto.randomUUID();
-  if (!(await store.acquireLock("sender", lockToken, deps.now().getTime(), LOCK_TTL_MS))) return "locked";
+  const startMs = deps.now().getTime();
+  if (!(await store.acquireLock("sender", lockToken, startMs, LOCK_TTL_MS))) return "locked";
 
+  let sentBatch = false;
+  let cancelled = false;
   try {
     const now = deps.now();
     const nowIso = now.toISOString();
@@ -69,13 +96,12 @@ export async function runSender(cfg: Config, deps: Deps): Promise<string> {
     const capLeft = cfg.maxTextsPerDay - (await store.getDailyCount(day));
     const limit = batchLimit(cfg.batchSize, job.segments, capLeft);
 
-    let results: RecipientResult[] = [];
     if (limit === 0) {
       const c = await store.jobCounts(job.id);
       if (c.pending > 0 && job.cap_notice_day !== day) {
         await store.setCapNoticeDay(job.id, day);
         const admin = adminFor(cfg, job);
-        // Over the cap on purpose: the admin must hear why sending stopped.
+        // Allowed past the cap on purpose: the admin must hear why sending stopped.
         if (admin) {
           await sendAndCount(
             cfg,
@@ -87,44 +113,53 @@ export async function runSender(cfg: Config, deps: Deps): Promise<string> {
         }
         log("daily_cap_reached", { job: job.id, sent: c.sent, total: c.total });
       }
+      if (c.pending > 0) return "capped";
     } else {
-      const due = await store.claimDue(job.id, limit, nowIso);
+      // Phone order matters: tidyRecipients relies on it after a crash.
+      const due = (await store.claimDue(job.id, limit, nowIso)).sort((a, b) => (a.phone < b.phone ? -1 : 1));
+      sentBatch = due.length > 0;
       let accepted = 0;
       for (const r of due) {
         const res = await sendSms(cfg, deps.fetch, r.phone, job.body);
-        const attempts = r.attempts + 1;
-        if (res.ok) {
-          accepted++;
-          results.push({ phone: r.phone, outcome: "sent", telnyxId: res.id });
-        } else if (res.retryable && attempts < MAX_ATTEMPTS) {
-          results.push({
-            phone: r.phone,
-            outcome: "retry",
-            attempts,
-            nextAttemptAt: new Date(now.getTime() + backoffMs(attempts)).toISOString(),
-            error: res.error,
-          });
-        } else {
-          results.push({ phone: r.phone, outcome: "failed", attempts, error: res.error, optedOut: res.optedOut });
+        const result = toResult(r.phone, r.attempts + 1, res, now);
+        if (res.ok) accepted++;
+        else log("recipient_error", { job: job.id, to: mask(r.phone), attempt: r.attempts + 1, error: res.error });
+        const jobStatus = await store.saveResult(job.id, result, nowIso);
+        if (jobStatus !== "sending") {
+          cancelled = true;
+          await store.skipUnsentClaims(job.id);
+          log("batch_stopped", { job: job.id, jobStatus });
+          break;
         }
-        if (!res.ok) log("recipient_error", { job: job.id, to: mask(r.phone), attempt: attempts, error: res.error });
       }
-      await store.saveResults(job.id, results, nowIso);
-      await store.addDailyCount(day, accepted);
+      if (!cfg.dryRun) {
+        await store.addDailyCount(day, accepted * job.segments);
+        if (job.kind === "welcome") await store.markWelcomedFromJob(job.id, nowIso);
+      }
       if (due.length) log("batch_sent", { job: job.id, tried: due.length, accepted, dryRun: cfg.dryRun });
+      if (cancelled) return "cancelled";
     }
 
     const c = await store.jobCounts(job.id);
-    if (c.pending === 0 && (await store.finishJob(job.id, nowIso))) {
-      if (job.kind === "welcome") await store.markWelcomedFromJob(job.id, nowIso);
-      const admin = adminFor(cfg, job);
-      const text = summaryText(job, c, cfg.dryRun);
-      if (admin) await sendAndCount(cfg, deps, admin, text, day);
-      log("job_done", { job: job.id, ...c, dryRun: cfg.dryRun });
-      return "done";
+    if (c.pending > 0) return sentBatch ? "sent_batch" : "waiting";
+
+    // Everyone's been tried. Give the carriers a minute or two to report delivery.
+    if (!cfg.dryRun && c.awaitingReceipt > 0 && job.finish_waits < RECEIPT_WAITS) {
+      await store.bumpJobCounter(job.id, "finish_waits");
+      return "waiting_receipts";
     }
-    return results.length ? "sent_batch" : "waiting";
+
+    const admin = adminFor(cfg, job);
+    const text = summaryText(job, c, cfg.dryRun);
+    const delivered = admin ? (await sendAndCount(cfg, deps, admin, text, day)).ok : true;
+    if (!delivered && job.summary_attempts + 1 < SUMMARY_ATTEMPTS) {
+      await store.bumpJobCounter(job.id, "summary_attempts");
+      return "summary_retry";
+    }
+    await store.finishJob(job.id, nowIso);
+    log("job_done", { job: job.id, ...c, summarySent: delivered, dryRun: cfg.dryRun });
+    return "done";
   } finally {
-    await store.releaseLock("sender", lockToken);
+    await store.releaseLock("sender", lockToken, sentBatch ? startMs + BATCH_GAP_MS : undefined);
   }
 }

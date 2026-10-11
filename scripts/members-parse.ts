@@ -18,7 +18,8 @@ export interface ParseResult {
 }
 
 // A US phone number written any common way.
-const PHONE_RE = /(?:\+?1[\s.\-]*)?\(?\d{3}\)?[\s.\-]*\d{3}[\s.\-]*\d{4}(?!\d)/g;
+export const PHONE_RE = /(?<![\d+])(?:\+?1[\s.\-]*)?\(?\d{3}\)?[\s.\-]*\d{3}[\s.\-]*\d{4}(?!\d)/g;
+const EXTENSION_RE = /\s*(?:ext\.?|extension|x)\s*\d{1,6}\b/i;
 const TOLL_FREE = new Set(["800", "833", "844", "855", "866", "877", "888"]);
 
 export function parseMemberList(input: string): ParseResult {
@@ -33,7 +34,7 @@ export function parseMemberList(input: string): ParseResult {
       const line = i + 1;
       const text = raw.trim();
       if (!text) return;
-      const matches = [...text.matchAll(PHONE_RE)].filter((m) => !isPartOfLongerNumber(text, m));
+      const matches = [...text.matchAll(PHONE_RE)];
       const digitCount = (text.match(/\d/g) ?? []).length;
 
       if (matches.length === 0) {
@@ -66,7 +67,14 @@ export function parseMemberList(input: string): ParseResult {
         return;
       }
 
-      const name = cleanName(text.replace(matches[0][0], " "));
+      let rest = text;
+      for (const m of matches) rest = rest.replace(m[0], " ");
+      if (EXTENSION_RE.test(rest)) {
+        flags.push({ line, text, problem: "has an extension, so probably not a cell phone; skipped" });
+        return;
+      }
+      const name = cleanName(rest);
+      if (/\d/.test(name)) flags.push({ line, text, problem: `name has numbers in it ("${name}"); check it` });
       if (seen.has(phone)) {
         flags.push({ line, text, problem: `same number as line ${seen.get(phone)}; skipped` });
         return;
@@ -79,11 +87,6 @@ export function parseMemberList(input: string): ParseResult {
   return { rows, flags };
 }
 
-function isPartOfLongerNumber(text: string, m: RegExpMatchArray): boolean {
-  const before = text[(m.index ?? 0) - 1];
-  return before !== undefined && /\d/.test(before);
-}
-
 function cleanName(s: string): string {
   return s
     .replace(/["']/g, "")
@@ -92,6 +95,11 @@ function cleanName(s: string): string {
     .replace(/\s+/g, " ")
     .trim()
     .slice(0, 60);
+}
+
+/** Hides all but the last 4 digits of every phone number in a line, for printing. */
+export function maskLine(text: string): string {
+  return text.replace(PHONE_RE, (m) => `…${m.replace(/\D/g, "").slice(-4)}`).replace(/\d(?=(?:\D*\d){4})/g, "•");
 }
 
 export function toCsv(rows: { name: string; phone: string }[]): string {

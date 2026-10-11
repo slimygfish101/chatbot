@@ -23,6 +23,11 @@ export function mask(phone: string | null | undefined): string {
   return `…${d.slice(-4)}`;
 }
 
+/** For texts to the admin (plain GSM characters only): "ending 1234". */
+export function smsMask(phone: string): string {
+  return `ending ${phone.replace(/\D/g, "").slice(-4)}`;
+}
+
 /** Parses the comma-separated ADMIN_NUMBERS setting. Invalid entries are dropped. */
 export function parseAdminNumbers(value: string | undefined): string[] {
   return (value ?? "")

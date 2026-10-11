@@ -2,14 +2,14 @@
 //   npm run export            (add --local for the local test database)
 import { writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { ROOT, wrangler } from "./lib";
+import { d1Rows, ROOT, wrangler } from "./lib";
 
 const where = process.argv.includes("--local") ? "--local" : "--remote";
 const r = wrangler(
   ["d1", "execute", "text-blast-db", where, "--json", "--command", "SELECT name, phone, status, added_at, welcomed_at FROM members ORDER BY status, name"],
   { quiet: true },
 );
-const results: any[] = JSON.parse(r.out.slice(r.out.indexOf("[")))[0]?.results ?? [];
+const results: any[] = d1Rows(r);
 const esc = (v: unknown) => {
   const s = v == null ? "" : String(v);
   return /[",\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
